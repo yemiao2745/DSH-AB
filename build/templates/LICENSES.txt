@@ -1,0 +1,45 @@
+Third-party licenses
+====================
+
+DSH-AB ships the following third-party components. All of them are redistributed
+unmodified. The full license text of each component is kept in that component's
+own directory inside this installation.
+
+Node.js
+  Component:  slot-a\node\
+  License:    MIT
+  Copyright:  Node.js contributors
+
+@deepseek-ai/dsh and its dependency tree
+  Component:  slot-a\app\
+  License:    MIT
+  Copyright:  DeepSeek
+  Note:       This is the unmodified upstream package tree.
+
+Git for Windows
+  Component:  runtime\git\
+  License:    GPL-2.0
+  Copyright:  the Git for Windows project and the Git project
+  Note:       Redistributed unmodified. Source is available at
+              https://github.com/git-for-windows/git
+              DSH-AB only invokes git as a separate program.
+
+Go runtime and standard library (statically linked into DSH_AB.exe)
+  License:    BSD-3-Clause
+  Copyright:  The Go Authors
+
+github.com/getlantern/systray
+  License:    Apache-2.0
+  Copyright:  Lantern
+
+github.com/BurntSushi/toml
+  License:    MIT
+  Copyright:  TOML authors
+
+golang.org/x/sys
+  License:    BSD-3-Clause
+  Copyright:  The Go Authors
+
+Inno Setup (used to build, not redistributed)
+  License:    Inno Setup License (see https://jrsoftware.org/isinfo.php)
+  Copyright:  Jordan Russell and Martijn Laan
