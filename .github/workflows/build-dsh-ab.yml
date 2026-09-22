@@ -1,0 +1,401 @@
+# DSH-AB - one release per DSH-AB version, holding one installer per upstream dsh version.
+#
+# ---------------------------------------------------------------------------------------------
+# THIS WORKFLOW CANNOT BE VALIDATED ON THE DEVELOPMENT MACHINE. Its first real run happens on
+# GitHub, and the first run is the experiment: watch it in the Actions tab.
+#
+# Checked locally: the YAML parses; every local command in it is the same one that is known to
+# work there (go test ./... -count=1 in src\dsh-ab, build\build.ps1 -DshVersion <ver> [-Offline],
+# build\verify-silent.ps1, and the discover block run against fed-in version and asset lists);
+# every PowerShell block in it parses. NOT checked: the runner image, the toolchain download URLs,
+# actions/setup-go, the upstream API responses, the cache behaviour and the release publication.
+#
+# Release shape: the tag is dshab-<DSH-AB version>, so one DSH-AB version owns exactly one release
+# and every installer is an asset of it. A (DSH-AB, dsh) pair whose asset is already there is
+# skipped instead of rebuilt, so a daily poll with nothing new builds and publishes nothing.
+#
+# Triggers: repository_dispatch (upstream webhook or a manual API call), a daily schedule, and
+# workflow_dispatch. Schedule and repository_dispatch only fire from the DEFAULT branch, so this
+# file has to be on it before either does anything.
+#
+# Credentials: the implicit GITHUB_TOKEN (permissions: contents: write below). No repository secret
+# is configured and none is needed. This repository never contains, reads or prints
+# .secrets\github.toml - that file is git-ignored and stays on the development machine.
+# ---------------------------------------------------------------------------------------------
+
+name: build-dsh-ab
+
+on:
+  repository_dispatch:
+    # curl -X POST -H "Authorization: Bearer <token>" \
+    #   https://api.github.com/repos/<owner>/DSH-AB/dispatches \
+    #   -d '{"event_type":"dsh-ab-build"}'
+    # The payload may carry {"dsh_versions":"0.1.5-rc.2,0.1.2-rc.1"} to build a subset.
+    types: [dsh-ab-build]
+  schedule:
+    # Daily poll so a new upstream release shows up without anyone remembering to dispatch.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dsh_versions:
+        description: 'dsh versions to build, comma separated (empty = every upstream release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-dsh-ab
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: discover upstream dsh versions
+    runs-on: windows-latest
+    outputs:
+      versions: ${{ steps.rc.outputs.versions }}
+      has_work: ${{ steps.rc.outputs.has_work }}
+      dshab: ${{ steps.rc.outputs.dshab }}
+      tag: ${{ steps.rc.outputs.tag }}
+      # Which matrix cell builds the one in-place update pack of this run (see the build job).
+      update_cell: ${{ steps.rc.outputs.update_cell }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: List the upstream releases this release does not carry yet
+        id: rc
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_VERSIONS: ${{ github.event.inputs.dsh_versions }}
+          DISPATCH_VERSIONS: ${{ github.event.client_payload.dsh_versions }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $headers = @{ 'User-Agent' = 'dsh-ab-ci'; 'Accept' = 'application/vnd.github+json' }
+          if ($env:GH_TOKEN) { $headers['Authorization'] = "Bearer $($env:GH_TOKEN)" }
+
+          # This program's version and its one release tag. The value is read from
+          # src\dsh-ab\VERSION - the file build\mkpayload.ps1 reads into payload-manifest.json's
+          # dshab_version. That manifest is git-ignored and does not exist yet at this point, so the
+          # version is taken at its source instead of being written down here.
+          $dshab = (Get-Content -LiteralPath 'src\dsh-ab\VERSION' -Raw).Trim()
+          if (-not $dshab) { throw 'src\dsh-ab\VERSION 是空的' }
+          $tag = "dshab-$dshab"
+          Write-Host "dshab $dshab -> release $tag"
+
+          # Upstream tags look like dsh-v<version>; the version without that prefix is the npm
+          # version the payload is built from. One matrix cell per release, on every channel: an
+          # alpha, an rc and a final release without a suffix are all accepted - the channel a
+          # version is on is not this workflow's business, only that the version exists.
+          $requested = if ($env:MANUAL_VERSIONS) { $env:MANUAL_VERSIONS } else { $env:DISPATCH_VERSIONS }
+          $versions = @()
+          if ($requested) {
+            Write-Host "versions asked for by the trigger: $requested"
+            foreach ($v in ($requested -split '[,\s]+')) {
+              if ($v) { $versions += ($v.Trim() -replace '^dsh-v', '') }
+            }
+          } else {
+            $uri = 'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=100'
+            $releases = Invoke-RestMethod -Uri $uri -Headers $headers
+            foreach ($rel in @($releases)) {
+              # Assigned per iteration, so $Matches always belongs to the tag just matched.
+              if ($rel.tag_name -match '^dsh-v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') { $versions += $Matches[1] }
+            }
+          }
+
+          $versions = @($versions | Sort-Object -Unique)
+          if ($versions.Count -eq 0) { throw 'no dsh version found (upstream API, or the list the trigger asked for)' }
+          Write-Host "$($versions.Count) dsh version(s): $($versions -join ', ')"
+
+          # An asset of the release is what says "this (DSH-AB, dsh) pair is published": the name
+          # is the one build\build.ps1 gives the installer. A release that is not there yet answers
+          # 404 and counts as nothing published.
+          function Get-AssetName([string]$DshVersion) { "DSH-AB-$dshab-$DshVersion-setup.exe" }
+          $existing = @()
+          try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" -Headers $headers
+            $existing = @($release.assets | ForEach-Object { $_.name })
+            Write-Host "release $tag already has $($existing.Count) asset(s)"
+          } catch {
+            Write-Host "release $tag does not exist yet: $($_.Exception.Message)"
+          }
+          $pending = @($versions | Where-Object { $existing -notcontains (Get-AssetName $_) })
+          $skipped = @($versions | Where-Object { $existing -contains (Get-AssetName $_) })
+          if ($skipped.Count -gt 0) { Write-Host "already published, skipped: $($skipped -join ', ')" }
+          if ($pending.Count -gt 0) { Write-Host "to build: $($pending -join ', ')" }
+          else { Write-Host 'nothing to build: every asset of this release is published' }
+
+          # Built by hand: ConvertTo-Json turns a one-element array into a scalar, and the matrix
+          # needs an array. has_work is what skips the build job when there is nothing new.
+          $json = '[' + (($pending | ForEach-Object { '"' + $_ + '"' }) -join ',') + ']'
+          $hasWork = if ($pending.Count -gt 0) { 'true' } else { 'false' }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "versions=$json"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "has_work=$hasWork"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "dshab=$dshab"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+
+          # 就地更新包与 dsh 版本无关（dsh 本体在槽里），一次运行只做一份：由待构建列表里的第一个
+          # 格子做（下面 build job 的 update_cell 条件）。没有待构建的版本时它为空，谁也不做。
+          $updateCell = if ($pending.Count -gt 0) { $pending[0] } else { '' }
+          if ($updateCell) { Write-Host "the update pack is built by the $updateCell cell" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "update_cell=$updateCell"
+
+  test:
+    # The program's own tests, on the same Go release the build job downloads into tools\go: the
+    # module lives in src\dsh-ab (the repository root is not a Go module). The icon tests are part
+    # of this run - they keep a broken .ico from shipping - and a failing test blocks the build
+    # below, so nothing unverified is released.
+    name: go test (src\dsh-ab)
+    runs-on: windows-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Provide the Go toolchain (actions/setup-go)
+        uses: actions/setup-go@v5
+        with:
+          # Keep in step with the version the build job downloads into tools\go below.
+          go-version: '1.24.0'
+          cache-dependency-path: src/dsh-ab/go.sum
+
+      - name: go test
+        working-directory: src/dsh-ab
+        run: go test ./... -count=1
+
+  build:
+    name: dsh ${{ matrix.dsh_version }}
+    needs: [discover, test]
+    # An empty matrix is a workflow error ("Matrix vector 'dsh_version' does not contain any
+    # values"), and a run whose installers are all published already has nothing to build.
+    if: needs.discover.outputs.has_work == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh_version: ${{ fromJSON(needs.discover.outputs.versions) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Provide the build toolchain (Go 1.24.0, Inno Setup 6.7.3)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # build\build.ps1 looks for the Go toolchain at <repo>\tools\go\bin\go.exe and for
+          # Inno Setup at %LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe - the same two places
+          # as on the development machine. tools\ is git-ignored, so it is provisioned here.
+          $goVersion = '1.24.0'
+          $goZip = Join-Path $env:RUNNER_TEMP "go$goVersion.windows-amd64.zip"
+          Invoke-WebRequest -Uri "https://go.dev/dl/go$goVersion.windows-amd64.zip" -OutFile $goZip -UseBasicParsing
+          $goExtract = Join-Path $env:RUNNER_TEMP 'go-extract'
+          Remove-Item -Recurse -Force $goExtract -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $goZip -DestinationPath $goExtract
+          Remove-Item -Recurse -Force 'tools\go' -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path 'tools' | Out-Null
+          Move-Item -LiteralPath (Join-Path $goExtract 'go') -Destination 'tools\go'
+          & 'tools\go\bin\go.exe' version
+
+          # /CURRENTUSER keeps the per-user layout build.ps1 expects.
+          # Inno Setup moved its binaries to immutable GitHub releases in March 2026, so the old
+          # files.jrsoftware.org/is/6/innosetup-<version>.exe path 404s now. The tag is the version
+          # with dots as underscores (6.7.3 -> is-6_7_3), derived so the pin lives in one place.
+          $isVersion = '6.7.3'
+          $isExe = Join-Path $env:RUNNER_TEMP "innosetup-$isVersion.exe"
+          $isTag = 'is-' + ($isVersion -replace '\.', '_')
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$isTag/innosetup-$isVersion.exe" -OutFile $isExe -UseBasicParsing
+          Start-Process -FilePath $isExe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/SP-' -Wait
+          $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+          Write-Host "ISCC: $iscc"
+
+      - name: Restore the payload cache (Node zip, MinGit zip, dsh trees, npm cache)
+        id: payload-cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: payload-${{ runner.os }}-${{ matrix.dsh_version }}-${{ hashFiles('build/payload-sources.json') }}
+
+      - name: Warm the payload cache from the network (cache miss only)
+        if: steps.payload-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          # -Offline can only run against a populated cache and a fresh runner has none, so a
+          # cold cell populates it here once. The installer is skipped: the next step is the
+          # real, offline build.
+          pwsh -NoProfile -File build\build.ps1 -DshVersion '${{ matrix.dsh_version }}' -SkipInstaller
+
+      - name: Build the installer offline
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File build\build.ps1 -DshVersion '${{ matrix.dsh_version }}' -Offline
+
+      - name: Verify silently (clear -> assert empty -> silent install -> silent uninstall)
+        shell: pwsh
+        run: |
+          # -Dir and -Iss default to the development machine's paths, so the runner overrides
+          # both. Everything else in verify-silent.ps1 is relative to the checkout.
+          pwsh -NoProfile -File build\verify-silent.ps1 -Dir '${{ github.workspace }}\.tmp-verify\install' -Iss '${{ github.workspace }}\installer\dsh-ab.iss'
+
+      - name: Locate the built installer
+        id: artefact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The payload manifest is the one place the expected name and versions come from, the
+          # same record verify-silent.ps1 checks the built installer against.
+          $mf = Get-Content -LiteralPath 'payload\payload-manifest.json' -Raw | ConvertFrom-Json
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist\DSH-AB-$($mf.dshab_version)-$($mf.dsh_version)-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "installer not found: $setup" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "setup=$setup"
+          Write-Host "installer: $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB)"
+          Write-Host "sha256: $((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash)"
+
+      - name: Upload the installer as a workflow artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-AB-setup-${{ matrix.dsh_version }}
+          path: ${{ steps.artefact.outputs.setup }}
+          if-no-files-found: error
+
+      # 就地更新包：build.ps1 每个矩阵格都会构建它（dist\DSH-AB-<dshab>-update.zip），但一个 DSH-AB
+      # 版本只需要一份，所以只有 update_cell 那一格上传。
+      - name: Upload the in-place update pack
+        if: matrix.dsh_version == needs.discover.outputs.update_cell
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-AB-update
+          path: ${{ github.workspace }}\dist\DSH-AB-${{ needs.discover.outputs.dshab }}-update.zip
+          if-no-files-found: error
+
+  # One release per DSH-AB version, written once and after the whole matrix: the cells must not
+  # race each other into creating the same release.
+  publish:
+    name: publish the ${{ needs.discover.outputs.tag }} release
+    needs: [discover, build]
+    # Skipped when the build job was skipped (nothing to build); a partially failed matrix still
+    # publishes the installers that did build.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    runs-on: windows-latest
+    steps:
+      - name: Download every installer this run built
+        uses: actions/download-artifact@v4
+        with:
+          pattern: DSH-AB-setup-*
+          merge-multiple: true
+          path: dist
+
+      # 那一格失败时这个 artifact 根本不存在；安装包该发还是要发，所以不让它把整个 job 拖垮，
+      # 缺了更新包由下面那一步说出来。
+      - name: Download the in-place update pack
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: DSH-AB-update
+          path: dist
+
+      - name: Ensure the release exists, then upload the installers
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # gh release view fails on purpose while the release does not exist yet.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $repo  = '${{ github.repository }}'
+          $tag   = '${{ needs.discover.outputs.tag }}'
+          $dshab = '${{ needs.discover.outputs.dshab }}'
+          $base = "https://github.com/$repo/releases/download/$tag"
+
+          # Nothing built means nothing to open a release for: an empty release would be worse
+          # than none, so a run where every cell failed publishes nothing.
+          $setups = @(Get-ChildItem -LiteralPath 'dist' -File -Filter 'DSH-AB-*-setup.exe')
+          if ($setups.Count -eq 0) {
+            Write-Host 'no installer was built in this run, nothing to publish'
+            exit 0
+          }
+          $updates = @(Get-ChildItem -LiteralPath 'dist' -File -Filter 'DSH-AB-*-update.zip')
+          if ($updates.Count -eq 0) {
+            Write-Warning 'dist 里没有就地更新包（做它的那一格大概失败了）：这次只发安装包'
+          }
+
+          # 版本排序只按数字：字符串排序会把 0.1.10 排到 0.1.9 前面，也会把 0.1.0-rc.7 排到
+          # 0.1.7-alpha.2 前面。而 Release 页面里的 asset 列表恰恰就是按文件名排的，改不了——所以
+          # 说明最上方放一张表，打开页面第一眼就是最新的那一版。
+          function Get-VersionKey([string]$Version) {
+            $core, $pre = $Version -split '-', 2
+            $n = @(($core -split '\.') | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+            while ($n.Count -lt 3) { $n += 0 }
+            $preKey = ''
+            if ($pre) {
+              # 预发布里的数字补齐到六位再比，rc.10 才不会排到 rc.9 前面。
+              $preKey = (($pre -split '(\d+)') | ForEach-Object {
+                if ($_ -match '^\d+$') { $_.PadLeft(6, '0') } else { $_ }
+              }) -join ''
+            }
+            [pscustomobject]@{
+              Major = $n[0]; Minor = $n[1]; Patch = $n[2]
+              # 全表按「新 → 旧」排：正式版（1）排在它自己的预发布（0）前面。
+              Rank = if ($pre) { 0 } else { 1 }
+              Pre = $preKey
+            }
+          }
+          $rows = @(foreach ($s in $setups) {
+            # 这里能直接减掉 DSH-AB 自己的版本号：它来自本次 discover，不会认错。
+            $dsh = ($s.Name -replace ("^DSH-AB-" + [regex]::Escape($dshab) + "-"), '') -replace '-setup\.exe$', ''
+            [pscustomobject]@{ Key = (Get-VersionKey $dsh); Dsh = $dsh; Name = $s.Name }
+          })
+          $sortKeys = @(
+            @{ Expression = { $_.Key.Major }; Descending = $true },
+            @{ Expression = { $_.Key.Minor }; Descending = $true },
+            @{ Expression = { $_.Key.Patch }; Descending = $true },
+            @{ Expression = { $_.Key.Rank };  Descending = $true },
+            @{ Expression = { $_.Key.Pre };   Descending = $true }
+          )
+          $rows = @($rows | Sort-Object -Property $sortKeys)
+
+          # One element per line: Set-Content writes the array as the note text.
+          $notes = @()
+          $notes += "# DSH-AB $dshab"
+          $notes += ''
+          $notes += '## 下载（最新在最上面）'
+          $notes += ''
+          $notes += '| dsh 版本 | 安装包 |'
+          $notes += '| --- | --- |'
+          foreach ($row in $rows) {
+            $notes += "| $($row.Dsh) | [$($row.Name)]($base/$($row.Name)) |"
+          }
+          foreach ($u in $updates) {
+            $notes += "| 就地更新包（与 dsh 版本无关） | [$($u.Name)]($base/$($u.Name)) |"
+          }
+          $notes += ''
+          $notes += '> 下面的 Assets 文件列表是 GitHub 按**文件名**排序的，和版本新旧无关：要看最新版就看上面这张表。'
+          $notes += ''
+          $notes += "DSH-AB $dshab：本 Release 收录上游各 dsh 版本的安装包。"
+          $notes += 'asset 名形如 DSH-AB-<DSH-AB 版本>-<dsh 版本>-setup.exe，两段版本分别是 DSH-AB 与 dsh 的版本。'
+          $notes += 'DSH-AB-<DSH-AB 版本>-update.zip 是就地更新包：一个 DSH-AB 版本一份，与 dsh 版本无关，覆盖到安装根的程序文件上即可（槽位与 dsh-ab.toml 不受影响）。'
+          $notes += '上游出新版本（alpha / rc / 正式版都算）时由本工作流自动构建并加进来，已经在这里的版本不重复构建。'
+          $notes += 'Windows x64，安装包未做代码签名。'
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8
+          Write-Host "notes: $($rows.Count) installer(s), $($updates.Count) update pack(s)"
+
+          $null = gh release view $tag --repo $repo 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "release $tag exists, refreshing its notes"
+            gh release edit $tag --repo $repo --latest --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed: $tag" }
+          } else {
+            gh release create $tag --repo $repo --title "DSH-AB $dshab" --latest --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed: $tag" }
+          }
+
+          foreach ($file in (@($setups) + @($updates))) {
+            Write-Host "uploading $($file.Name)"
+            gh release upload $tag $file.FullName --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed: $($file.Name)" }
+          }
+          Write-Host "$($setups.Count) installer(s) and $($updates.Count) update pack(s) in release $tag"

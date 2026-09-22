@@ -1,0 +1,6 @@
+# DSH-AB 的基线仓库：只提交配置与状态。
+# 槽位是完整的 dsh 实例，runtime\ 放随包的 Git，logs\ 是可丢弃的日志。
+slot-a/
+slot-b/
+runtime/
+logs/

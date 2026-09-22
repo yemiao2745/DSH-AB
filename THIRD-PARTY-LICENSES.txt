@@ -1,0 +1,14 @@
+DSH-AB is MIT licensed (see LICENSE). It redistributes the following third-party components:
+
+  DeepSeek Harness (dsh)            MIT
+  Node.js                           MIT
+  MinGit / Git for Windows          GPL-2.0   <- GPL text and source offer required
+  getlantern/systray (compiled in)  Apache-2.0
+  Inno Setup (build-time only)      Inno Setup License (not redistributed)
+
+GPL-2.0 notice: this package redistributes MinGit, which is licensed under GPL-2.0.
+The full text of GPL-2.0 is included in gpl-2.0.txt. The corresponding source for MinGit is
+available from the Git for Windows project (https://github.com/git-for-windows/git), matching
+the version recorded in payload-manifest.json.
+
+Each component remains under its own license; DSH-AB's MIT license applies to DSH-AB only.
