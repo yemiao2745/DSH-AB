@@ -1,0 +1,37 @@
+# Build inputs that are not source.
+tools/
+.tmp-src/
+
+# Build products (payload/ and dist/ are assembled, never committed).
+payload/
+dist/
+
+# Downloaded build inputs: verified and cached inside the workspace so a
+# build repeats offline. The pins for them live in build/payload-sources.json and are committed.
+cache/
+# 两种 exe，同一个 build 目录，绝不与正式产物同名：正式（DSH_AB.exe）与测试构建
+# （build.ps1 -TestProduct → DSH_ABtest.exe）。更新包不再单独编 exe（它就是安装包那一份），
+# 下面那条 DSH-AB*.exe 留着兜底构建目录里的其它东西。
+build/DSH_AB*.exe
+build/DSH-AB*.exe
+src/dsh-ab/dsh-ab.exe
+
+# Local scratch.
+.tmp-run/
+.tmp-install/
+.tmp-verify/
+.tmp-test/
+.tmp-probe/
+
+# 本地私有：凭据（绝不提交、不进安装包、不进日志）
+.secrets/
+
+# 开发文档（计划、待办、缺陷记录、证据、验证协议、子代理计划、草稿）一律不上传。
+# 靠目录结构保证，不靠一份会漂移的文件清单：公开的 docs\ 只留顶层文件（MAINTAINING.md），
+# 本地开发笔记都在 docs\ 的子目录里。
+docs/*/
+
+# 记忆库与其它本地状态（绝不能上传）
+.dsh-meow/
+# 所有临时目录一律排除（.tmp-* 是构建/测试脚手架）
+.tmp-*/
