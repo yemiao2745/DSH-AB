@@ -495,7 +495,9 @@ func TestStatusPopupReportsWhichCopyIsTalking(t *testing.T) {
 	text := a.statusText()
 	for _, want := range []string{
 		"安装根：" + root,
-		"版本：" + versionText(effectiveDshabVersion(), dshVersion),
+		// 只有 DSH-AB 自己的版本：编进本 exe 的那个 dsh 版本已经被两行槽位行取代，
+		// 它正是「升级后弹窗还报旧版本」的来源。
+		"版本：DSH-AB " + effectiveDshabVersion(),
 		"日志路径：" + a.lg.Path(),
 	} {
 		if !strings.Contains(text, want) {
@@ -545,5 +547,107 @@ func TestStatusPopupUsesTheMenuLabel(t *testing.T) {
 	}
 	if strings.TrimSpace(text) == "" {
 		t.Error("状态弹窗没有正文")
+	}
+}
+
+// TestRefreshLoopNoticesAnExternallyWrittenRegistration: the tray read state once at
+// startup, so a registration the maintenance agent wrote stayed invisible - the menu
+// kept saying 「槽位切换」and 重启 silently did not switch (2026-09-24，真机报告). It
+// must now be noticed, announced exactly once, and never written back.
+func TestRefreshLoopNoticesAnExternallyWrittenRegistration(t *testing.T) {
+	root := t.TempDir()
+	cfg := launchTestConfig()
+	writeSlot(t, root, slotA, cfg)
+	writeSlot(t, root, slotB, cfg)
+	a, st := newTrayTestApp(t, root, cfg)
+	var popups []string
+	a.popup = func(title, text string, isErr bool) { popups = append(popups, title+"|"+text) }
+
+	if got := rollbackMenuTitle(cfg, st.RollbackPhase()); got != "槽位切换" {
+		t.Fatalf("默认态菜单文字 = %q", got)
+	}
+	mustWrite(t, filepath.Join(root, "state", "pending.json"), `{"target_slot":"slot-b"}`)
+	a.refreshFromDisk()
+
+	if got := rollbackMenuTitle(cfg, st.RollbackPhase()); got != "槽位切换：待生效" {
+		t.Fatalf("外部登记后菜单文字 = %q，应为 槽位切换：待生效", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "state", "pending.json")); err != nil {
+		t.Fatalf("刷新把别人写的登记抹掉了：%v", err)
+	}
+	if len(popups) != 1 {
+		t.Fatalf("第一次看见登记时应当恰好一个提示，实际 %d 个：%v", len(popups), popups)
+	}
+	if !strings.Contains(popups[0], "slot-b") || !strings.Contains(popups[0], "重启") {
+		t.Errorf("提示没有说清切到哪个槽、什么时候生效：%q", popups[0])
+	}
+
+	// 同一个登记不再重复弹窗。
+	a.refreshFromDisk()
+	a.refreshFromDisk()
+	if len(popups) != 1 {
+		t.Fatalf("同一个登记弹了多次：%v", popups)
+	}
+
+	// 登记被清掉是静默的：那正是托盘自己撤销后的样子。
+	if err := os.Remove(filepath.Join(root, "state", "pending.json")); err != nil {
+		t.Fatal(err)
+	}
+	a.refreshFromDisk()
+	if got := rollbackMenuTitle(cfg, st.RollbackPhase()); got != "槽位切换" {
+		t.Fatalf("登记清掉后菜单文字 = %q", got)
+	}
+	if len(popups) != 1 {
+		t.Fatalf("登记被清掉不该有提示：%v", popups)
+	}
+	// 闩必须跟着登记一起被清掉，否则第二次登记在同进程里彻底无声（2026-09-25 实测）。
+	if a.pendingNoticed {
+		t.Error("登记被清掉后闩还上着：下一次登记将不再提示")
+	}
+
+	// 第二次登记：同一进程里必须再提示一次。一次登记一次提示，不是一个进程一次。
+	mustWrite(t, filepath.Join(root, "state", "pending.json"), "{\"target_slot\":\"slot-b\"}")
+	a.refreshFromDisk()
+	if got := rollbackMenuTitle(cfg, st.RollbackPhase()); got != "槽位切换：待生效" {
+		t.Fatalf("第二次外部登记后菜单文字 = %q", got)
+	}
+	if len(popups) != 2 {
+		t.Fatalf("第二次登记没有再次提示（弹窗共 %d 个）：%v", len(popups), popups)
+	}
+	if !strings.Contains(popups[1], "slot-b") || !strings.Contains(popups[1], "重启") {
+		t.Errorf("第二次提示没有说清切到哪个槽：%q", popups[1])
+	}
+	// 同一条登记仍然只提示一次。
+	a.refreshFromDisk()
+	a.refreshFromDisk()
+	if len(popups) != 2 {
+		t.Fatalf("同一条第二次登记弹了多次：%v", popups)
+	}
+}
+
+// TestRestartConfirmMentionsTheSwitchOnlyWhenThereIsOne: the old body announced a
+// waiting switch unconditionally, so a plain restart read as if a slot switch were
+// about to happen. With a switch waiting it must say how many conversations each
+// slot holds and that the current slot’s conversations will not be visible after it.
+func TestRestartConfirmMentionsTheSwitchOnlyWhenThereIsOne(t *testing.T) {
+	root := t.TempDir()
+	cfg := launchTestConfig()
+	writeSlot(t, root, slotA, cfg)
+	writeSlot(t, root, slotB, cfg)
+	writeSlotSessions(t, root, slotA, 3)
+	writeSlotSessions(t, root, slotB, 5)
+	a, st := newTrayTestApp(t, root, cfg)
+
+	if text := a.restartConfirmText(); strings.Contains(text, "槽位切换") {
+		t.Fatalf("没有登记时重启确认框却提到了槽位切换：\n%s", text)
+	}
+	if err := st.Register(slotB); err != nil {
+		t.Fatal(err)
+	}
+	text := a.restartConfirmText()
+	for _, want := range []string{"slot-a", "slot-b", "看不到", "3", "5"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("有登记时重启确认框里缺少 %q：\n%s", want, text)
+		}
 	}
 }

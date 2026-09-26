@@ -52,6 +52,16 @@ type App struct {
 	// from a test panics.
 	tooltip func(text string)
 
+	// warned is how many of st.Warnings this App has already logged. main.go logs
+	// the ones the startup read produced, and the refresh loop logs each later one
+	// exactly once instead of once per tick.
+	warned int
+	// pendingNoticed is the latch behind the one popup that announces a registration
+	// this process did not make: one notice per registration, not one per process.
+	// refreshFromDisk clears it as soon as the registration is gone, so a later
+	// registration is announced again. A cleared registration itself stays silent.
+	pendingNoticed bool
+
 	// deferred holds the messages the operation running under opMu wants to show.
 	// A modal dialog blocks the goroutine that shows it, so showing one while the
 	// lock is held freezes every other tray action behind it (the recorded shape: "重启"
@@ -69,7 +79,7 @@ type App struct {
 }
 
 func NewApp(root string, cfg *Config, st *State, run *Runner, lg *Logger, cfgReport ConfigReport) *App {
-	return &App{
+	a := &App{
 		root:      root,
 		cfg:       cfg,
 		cfgReport: cfgReport,
@@ -89,6 +99,9 @@ func NewApp(root string, cfg *Config, st *State, run *Runner, lg *Logger, cfgRep
 			alert(title, text)
 		},
 	}
+	// 启动时已经写进日志的那些警告不再由刷新循环重复。
+	a.warned = len(st.Warnings)
+	return a
 }
 
 // onReady builds the six fixed menu items. A click on the icon opens the same
@@ -101,11 +114,12 @@ func (a *App) onReady() {
 
 	a.refreshLabels()
 
-	// The three workers start before anything else on this path: nothing that
+	// The four workers start before anything else on this path: nothing that
 	// follows may be a dialog the user has to dismiss first.
 	go a.serve()
 	go a.launch(true)
 	go a.healthLoop()
+	go a.refreshLoop()
 	// onReady only asks for the config notice; the dialog waits on a goroutine of
 	// its own, so nothing here can hold the entry point hostage.
 	a.configNotice()
@@ -272,6 +286,8 @@ func (a *App) launchLocked(initial bool) {
 			return
 		}
 	}
+	// 走到这里才是一次成功的启动：从这一刻起健康循环可以报告故障，托盘图标也可以说 dsh 在跑。
+	// 失败的启动路径都在上面 return 了，从不经过这里。
 	a.ready.Store(true)
 	a.refreshTooltip()
 }
@@ -515,11 +531,30 @@ func (a *App) openBrowserLocked() {
 }
 
 func (a *App) onRestart() {
-	if a.cfg.Rollback.ConfirmRestart && !confirm("重启 dsh", "确定要重启 dsh 吗？\n\n已经登记但未生效的槽位切换会在这次重启后生效。") {
+	if a.cfg.Rollback.ConfirmRestart && !confirm("重启 dsh", a.restartConfirmText()) {
 		return
 	}
 	a.lg.Info("用户请求重启")
 	a.launch(false)
+}
+
+// restartConfirmText is the body of the 重启 confirmation. It names a waiting
+// switch only when there really is one - the old text announced one
+// unconditionally, so a plain restart read as if a slot switch were about to happen.
+// When there is one it also states how many conversations each slot holds, because
+// the two slots keep separate DSH_HOME trees: switching makes the conversations
+// written in the current slot invisible, and that number is the honest way to say so.
+func (a *App) restartConfirmText() string {
+	if a.st.RollbackPhase() != phasePending {
+		return "确定要重启 dsh 吗？"
+	}
+	active, target := a.st.ActiveSlot(), a.st.Pending.TargetSlot
+	return fmt.Sprintf(
+		"确定要重启 dsh 吗？\n\n这次重启会让已登记的槽位切换生效：%s → %s。\n"+
+			"两个槽的对话数据是分开存的，切换后看不到当前槽 %s 里的对话。\n"+
+			"%s 会话 %d 个 / %s 会话 %d 个。",
+		active, target, active,
+		active, sessionCount(a.root, active), target, sessionCount(a.root, target))
 }
 
 // onRollback only ever writes or clears a registration. It never stops a process.
@@ -591,7 +626,10 @@ func (a *App) statusText() string {
 		if slot == a.run.Slot() && a.run.Running() {
 			state = "已安装，运行中"
 		}
-		fmt.Fprintf(&b, "%s：%s\n", slot, state)
+		// 每一行说清这个槽自己的事实：它装的 dsh 版本（读盘得来，不是编进本 exe 的那个）
+		// 和它的会话条数。
+		fmt.Fprintf(&b, "%s：%s　dsh %s　会话 %d 个\n",
+			slot, state, slotVersionText(dshVersionInSlot(a.root, a.cfg, slot)), sessionCount(a.root, slot))
 	}
 	if a.st.RollbackPhase() == phasePending {
 		fmt.Fprintf(&b, "\n槽位切换：待生效 → %s", a.st.Pending.TargetSlot)
@@ -602,7 +640,9 @@ func (a *App) statusText() string {
 	// Two installations run side by side and their popups look alike, so the
 	// popup says which copy is talking - the root, the build, and where its log is.
 	fmt.Fprintf(&b, "\n安装根：%s", a.root)
-	fmt.Fprintf(&b, "\n版本：%s", versionText(effectiveDshabVersion(), dshVersion))
+	// 只有 DSH-AB 自己的版本：编进本 exe 的那个 dsh 版本正是这两行槽位行曾经误报的来源，
+	// 它现在只留给 --version 与构建/发布脚本。
+	fmt.Fprintf(&b, "\n版本：DSH-AB %s", effectiveDshabVersion())
 	fmt.Fprintf(&b, "\n日志路径：%s", a.lg.Path())
 	fmt.Fprintf(&b, "\n%s", a.cfgReport.StatusLine())
 	return b.String()
@@ -611,8 +651,8 @@ func (a *App) statusText() string {
 // onLog cycles off / auto / full. It must never show a popup.
 func (a *App) onLog() {
 	a.lg.SetLevel(a.lg.NextLevel())
-	// auto 档也要看得见每次改档，所以这一行是 debug 不是 info。
-	a.lg.Debugf("日志级别切换为 %s", a.lg.Level())
+	// auto 档要看得见每次改档，所以这一行是 info：auto 收 info/warn/error，debug 只在 full 档。
+	a.lg.Info("日志级别切换为 %s", a.lg.Level())
 	if a.logItem != nil {
 		a.logItem.SetTitle(a.cfg.LogLabel(a.lg.Level()))
 	}
@@ -627,6 +667,53 @@ func (a *App) onExitClicked() {
 	a.opMu.Unlock()
 	a.refreshTooltip()
 	systray.Quit()
+}
+
+// refreshInterval is how often the tray re-reads state. Two seconds is the agreed
+// latency for a registration the maintenance agent wrote to show up in the menu;
+// one stat plus two small reads per tick costs nothing.
+const refreshInterval = 2 * time.Second
+
+// refreshLoop notices a registration somebody else wrote. Without it the menu kept
+// saying 槽位切换, the status popup kept saying 未登记, and 重启 read the Pending of
+// startup time and silently did not switch at all (2026-09-24, real report).
+func (a *App) refreshLoop() {
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		a.refreshFromDisk()
+	}
+}
+
+// refreshFromDisk adopts the state files as they are now and reports the
+// consequence: new menu text, and exactly one popup per registration that this process
+// did not make. A cleared registration is silent - the tray's own undo looks the same.
+// Warnings are logged once each, never once per tick.
+func (a *App) refreshFromDisk() {
+	changed := a.st.Reload()
+	for _, w := range a.st.Warnings[a.warned:] {
+		a.lg.Warnf("%s", w)
+	}
+	a.warned = len(a.st.Warnings)
+	if !changed {
+		return
+	}
+	a.refreshLabels()
+	if a.st.RollbackPhase() != phasePending {
+		// 登记没了就把闩打开。这里以前只在第一次 none→pending 时上闩、从不上闩，于是
+		// 第二次登记在同一进程里完全看不见：菜单和状态弹窗都更新了，唯独那条提示不再出现
+		// （2026-09-25 实测），而它是用户唯一能知道「有人登记了一次切槽」的地方。
+		a.pendingNoticed = false
+		return
+	}
+	if a.pendingNoticed {
+		return
+	}
+	a.pendingNoticed = true
+	target := a.st.Pending.TargetSlot
+	a.lg.Info("发现外部登记的槽位切换：→ %s", target)
+	a.popup(a.displayName()+" · "+rollbackMenuTitle(a.cfg, phasePending),
+		fmt.Sprintf("已登记槽位切换：→ %s\n点托盘「重启」后生效", target), false)
 }
 
 // healthLoop reports faults and never restarts anything: automatic restarts are

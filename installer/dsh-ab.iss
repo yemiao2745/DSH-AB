@@ -1,6 +1,6 @@
 ; dsh-ab.iss - DSH-AB installer.
 ;
-; Packages the payload assembled by build\mkpayload.ps1 into a single per-user installer:
+; Packages the payload assembled by build\py\dshab_build\mkpayload.py into a single per-user installer:
 ;   * installs to %LOCALAPPDATA%\DSH-AB by default, no administrator rights needed
 ;   * refuses to install anywhere that is not an empty folder (never overwrite, never merge),
 ;     and refuses a port that is already taken on 127.0.0.1 - but not a second DSH-AB: two
@@ -18,31 +18,57 @@
 ;   * does no git operation at all: the AI that maintains the installation runs git itself
 ;   * on uninstall asks about the user data and keeps it by default; /DELETEUSERDATA=1 answers that
 ;     question without asking and deletes it - the switch exists so that path is reachable by an
-;     automated run (verify-silent.ps1), which can never answer the question itself
+;     automated run (build\py\verify.py, scenario 2), which can never answer the question itself
 
-; 产品名。默认就是正式产品 DSH-AB；测试构建（build\build.ps1 -TestProduct）是另一个产品
+; 这份脚本自己在编译之前要被 build\py\build.py 用 build\py\dshab_build\isscheck.py 的 13 条源码级
+; 门禁逐条查一遍（静默安装、不许调 shell、快捷方式与 naming.go 对得上等规则都在那里），安装/卸载的
+; 验收场景在 build\py\verify.py（实现与断言在 build\py\dshab_verify\）。
+
+; 本次构建的值（产品、两个版本、要装的 exe、载荷根）由 build\py\build.py 写进
+; installer\dsh-ab.generated.iss，每一条都带 #ifndef 守卫，所以一个值只有一个来源：生成文件在时
+; 就取它，不在（手工编译一份 checkout）时就取下面各处的 #ifndef 默认值。生成文件是产物，不要编辑
+; 它，下一次构建会覆盖。它不是仓库里的源文件，所以不存在时编译也要照样成立 —— 这一句先问文件
+; 在不在，再决定要不要 #include。
+#if FileExists("dsh-ab.generated.iss")
+  #include "dsh-ab.generated.iss"
+#endif
+
+; 产品名。默认就是正式产品 DSH-AB；测试构建（build\py\build.py --test-product）是另一个产品
 ; DSH-ABtest：名字、默认安装目录、开始菜单条目、卸载登记项的 DisplayName 前缀和产物名全都带后缀，
 ; 所以它与正式安装在同一台机器上互不干扰。Go 侧的 appName 由 -ldflags -X 注入同一个值。
 #ifndef TestProduct
   #define TestProduct 0
 #endif
 #if TestProduct
-  #define AppName "DSH-ABtest"
-  #define DefaultDir "{localappdata}\DSH-ABtest"
-  ; 测试构建的 exe 由 build.ps1 单独构建：绝不复用 payload 里那份（它带着正式产品的名字），也绝不
+  #ifndef AppName
+    #define AppName "DSH-ABtest"
+  #endif
+  #ifndef DefaultDir
+    #define DefaultDir "{localappdata}\DSH-ABtest"
+  #endif
+  ; 测试构建的 exe 由 build\py\build.py 单独构建：绝不复用 payload 里那份（它带着正式产品的名字），也绝不
   ; 覆盖 build\DSH_AB.exe 或 dist 里的正式产物。
-  #define AppExeSource "..\build\DSH_ABtest.exe"
+  #ifndef AppExeSource
+    #define AppExeSource "..\build\DSH_ABtest.exe"
+  #endif
 #else
-  #define AppName "DSH-AB"
-  #define DefaultDir "{localappdata}\DSH-AB"
-  #define AppExeSource "..\payload\DSH_AB.exe"
+  #ifndef AppName
+    #define AppName "DSH-AB"
+  #endif
+  #ifndef DefaultDir
+    #define DefaultDir "{localappdata}\DSH-AB"
+  #endif
+  #ifndef AppExeSource
+    #define AppExeSource "..\payload\DSH_AB.exe"
+  #endif
 #endif
 ; Two different versions, and the build always passes both:
 ;   DshabVersion - this program's own version; source of truth: src\dsh-ab\VERSION
 ;   DshVersion   - the dsh that this payload carries (upstream tag dsh-v<DshVersion>)
-; The defaults only exist so the script still compiles when opened by hand; a real
-; build (build\build.ps1) passes /DDshabVersion=... /DDshVersion=... Both are shown on
-; the welcome page and on the finished page, and both appear in the output file name.
+; The defaults only exist so the script still compiles when opened by hand; a real build
+; (build\py\build.py) writes both into dsh-ab.generated.iss and also passes /DDshabVersion=...
+; /DDshVersion=... Both are shown on the welcome page and on the finished page, and both appear
+; in the output file name.
 #ifndef DshabVersion
   #define DshabVersion "0.0.0"
 #endif
@@ -52,11 +78,13 @@
 #define AppVersion DshabVersion
 #define AppPublisher "DSH-AB"
 #define AppExeName "DSH_AB.exe"
-; 载荷根（build\mkpayload.ps1 组装出来的那棵树）：仓库里的 payload\。ISCC 读不了超过 MAX_PATH 的
-; **源**路径，所以载荷内的相对路径必须短——这一条由 mkpayload.ps1 结尾的路径门禁保证（≤ 180 字符），
-; 加上仓库路径后仍远低于 260。曾经把载荷 subst 到空闲盘符再 /DPayload=X:\ 传进来，那只是把源前缀
-; 缩短，救不了载荷内部超长的相对路径，已删除。
-#define Payload "..\payload"
+; 载荷根（build\py\dshab_build\mkpayload.py 组装出来的那棵树）：仓库里的 payload\。ISCC 读不了超过
+; MAX_PATH 的**源**路径，所以载荷内的相对路径必须短——这一条由 mkpayload.py 结尾的路径门禁保证
+; （filetime.assert_relative_paths，≤ 180 字符），加上仓库路径后仍远低于 260。曾经把载荷 subst 到
+; 空闲盘符再 /DPayload=X:\ 传进来，那只是把源前缀缩短，救不了载荷内部超长的相对路径，已删除。
+#ifndef Payload
+  #define Payload "..\payload"
+#endif
 
 [Setup]
 ; AppId is what Inno keys its own bookkeeping on: the uninstall log it may append to, and the
@@ -147,9 +175,9 @@ Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 正式构建来自 payload（mkpayload.ps1 放进去的 build\DSH_AB.exe），测试构建来自 build.ps1 单独构建
-; 的那一份：见上面的 AppExeSource。
-; DestName: 测试构建的源文件叫 DSH_ABtest.exe（build.ps1 单独构建的那份），但装进 {app} 的名字必须是
+; 正式构建来自 payload（build\py\dshab_build\mkpayload.py 放进去的 payload\DSH_AB.exe），测试构建
+; 来自 build\py\build.py 单独构建的 build\DSH_ABtest.exe：见上面的 AppExeSource。
+; DestName: 测试构建的源文件叫 DSH_ABtest.exe（build\py\build.py 单独构建的那份），但装进 {app} 的名字必须是
 ; AppExeName（DSH_AB.exe）：图标、[Run] 和 naming.go 的扫描规则都认这个名字。
 Source: "{#AppExeSource}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
 Source: "{#Payload}\dsh-ab.toml"; DestDir: "{app}"; Flags: ignoreversion
@@ -222,6 +250,80 @@ FinishedLabelNoIcons=安装程序已在您的计算机中安装了 [name]。%n%n
 ConfirmUninstall=确定要卸载 %1 及其所有组件吗？
 
 [Code]
+// ---- the two native Win32 blocks below, declared once -----------------------------------------
+// Pascal Script has no socket and no process API of its own, and this installer runs no helper
+// program of its own, so both jobs are done in-process through the functions declared here.
+// Every script-side name below is the DLL's own name.
+const
+  // IsPortFree: the three arguments socket() takes.
+  AF_INET = 2;
+  SOCK_STREAM = 1;
+  IPPROTO_TCP = 6;
+  // OwnRunningProcesses: the Toolhelp flag and the two access rights it needs.
+  TH32CS_SNAPPROCESS = $00000002;
+  INVALID_HANDLE_VALUE = $FFFFFFFF;
+  PROCESS_QUERY_LIMITED_INFORMATION = $1000;
+  PROCESS_TERMINATE = $0001;
+  MAX_PATH = 260;
+  // The image-path buffer QueryFullProcessImageNameW fills in, counted in characters.
+  EXE_PATH_CHARS = 1024;
+  // sizeof(PROCESSENTRY32W) as the 32-bit setup/uninstaller compiles it: four 8-byte field pairs
+  // (0..31), dwFlags (32..35) and szExeFile (260 wide chars, 36..555), 4-byte alignment and no tail
+  // padding. dwSize has to carry this exact number before the first call, and the number is the
+  // caller's, not the machine's: Windows answers ERROR_BAD_LENGTH (24) unless dwSize matches what
+  // THIS process's bitness compiles - measured 2026-09-26 (.tmp-e2e\goprobe): the 32-bit probe
+  // accepted only 556 (568 answered 24) and the 64-bit probe only 568. Inno's setup and its
+  // uninstaller are 32-bit (PE Machine 0x014C), so 556 is the number they must pass.
+  PROCESSENTRY32W_SIZE = 556;
+
+type
+  // WSAStartup fills in a 398-byte WSADATA. Only its return code is read here, so the structure is
+  // one opaque buffer, sized comfortably past the real one.
+  TWSAData = record
+    Buf: array[0..511] of Byte;
+  end;
+
+  // sockaddr_in for 127.0.0.1:<port>, the 16 bytes bind() expects. sin_port and sin_addr are in
+  // network byte order, which the memory layout writes for us: a little-endian LongWord holding
+  // $0100007F is the four bytes 127.0.0.1, and the port is byte-swapped by hand (so no htons import).
+  TSockAddrIn = record
+    sin_family: Word;
+    sin_port: Word;
+    sin_addr: LongWord;
+    sin_zero: Int64;
+  end;
+
+  // PROCESSENTRY32W, at the offsets this 32-bit caller really uses. Measured 2026-09-26: the 32-bit
+  // layout is sizeof 556 with th32ProcessID at 8 and szExeFile at 36, while the 64-bit layout - the
+  // one the x64 Python verifier sizes for itself with ctypes.sizeof
+  // (build\py\dshab_verify\win_proc.py declares the same struct the same way) - is 568 and 44.
+  // Field by field here: dwSize 0..3 and cntUsage 4..7, th32ProcessID 8..11, th32DefaultHeapID
+  // 12..15 (a ULONG_PTR - 4 bytes on 32-bit), th32ModuleID 16..19 and cntThreads 20..23,
+  // th32ParentProcessID 24..27 and pcPriClassBase 28..31, dwFlags 32..35, szExeFile 36..555.
+  //
+  // Only th32ProcessID and szExeFile are ever read. Grouping the fields above th32ProcessID into
+  // 8-byte integers is what makes their boundaries land where Windows puts them under either packing
+  // rule - four 8-byte fields are contiguous, so 0, 8, 16, 24 whatever this compiler does - and
+  // dwFlags is 4 bytes, so the wide-char array (2-byte alignment) starts at 36 either way. An
+  // earlier version declared the x64 record here and passed 568 (szExeFile at 44) while this is a
+  // 32-bit process, so Process32FirstW answered ERROR_BAD_LENGTH (24), the scan gave up and a
+  // running installation was never closed before the uninstall deleted its files (2026-09-26
+  // 实测：卸载日志里的「Process32FirstW 失败（错误 24）」). szExeFile ends at 555, so the record always
+  // holds the 556 bytes dwSize asks for, whatever this compiler packs fields to.
+  TProcessEntry32W = record
+    SizeAndUsage: Int64;   // 0..7   dwSize + cntUsage
+    PidAndHeapId: Int64;   // 8..15  th32ProcessID + th32DefaultHeapID
+    Modules: Int64;        // 16..23 th32ModuleID + cntThreads
+    Parents: Int64;        // 24..31 th32ParentProcessID + pcPriClassBase
+    Flags: Cardinal;       // 32..35 dwFlags
+    ExeFile: array[0..MAX_PATH - 1] of Char;   // 36..555 szExeFile
+  end;
+
+  // The out-buffer of QueryFullProcessImageNameW, in UTF-16 characters.
+  TImagePath = record
+    Chars: array[0..EXE_PATH_CHARS - 1] of Char;
+  end;
+
 var
   PortsPage: TInputQueryWizardPage;
   ProductionPort: Integer;
@@ -229,6 +331,14 @@ var
   // 名字和两条快捷方式的落点只算一次，三个读取方都从这里拿（见 ComputeNames）。
   NameComputed: Boolean;
   CachedName, CachedIconPath, CachedDesktopIconPath: String;
+  // The native blocks below keep their buffers here instead of in a function body: each one is
+  // written field by field before it is used, and a global is the one place a record is certain to
+  // exist. Nothing here is shared between calls - the installer is single-threaded.
+  WsaReady: Boolean;
+  WsaData: TWSAData;
+  ProbeAddr: TSockAddrIn;
+  ScanEntry: TProcessEntry32W;
+  ImagePath: TImagePath;
 
 function DirIsEmpty(const Dir: string): Boolean;
 var
@@ -279,50 +389,63 @@ end;
 // `netstat -ano -p tcp` would have to read the state column, which is localized ("LISTENING" on an
 // English Windows, 中文 elsewhere) and therefore drifts.
 //
-// 2026-09-22（审计 2）：探测走 powershell.exe —— 与 OwnRunningProcesses 同一条系统进程途径，不再自己
-// 声明一套 ws2_32 调用，也不新增任何外部二进制。子进程里真的执行 Socket.Bind(127.0.0.1:Port)：退出码
-// 0 = 绑定成功 = 端口可用，其它 = 不可用（绑定失败、PowerShell 起不来、被策略拦住）。判据只有退出码，
-// **不解析任何文本**，所以与系统语言无关。
+// 2026-09-22（审计 2）→ 2026-09-25：探测曾经走 powershell.exe 的子进程（退出码 0 = 绑定成功）。现在整套
+// ws2_32 调用就在安装器进程里 —— socket / bind / closesocket，声明见下。判据没有变，也只有一个：bind 返回
+// 0 才算可用，**不解析任何文本**，所以与系统语言无关；连 socket 都要不到时一律算「不可用」，拒绝安装是
+// 安全的那一侧。
 // 绑定用的是朴素 bind：既没有 SO_REUSEADDR，也没有 SO_EXCLUSIVEADDRUSE。Windows 上只有自己设了
 // SO_REUSEADDR 的 socket 才能抢到别人已占的端口，所以朴素 bind 一定 WSAEADDRINUSE（Winsock 的绑定表）；
 // 而 SO_EXCLUSIVEADDRUSE 会把仅仅处于 TIME_WAIT 的端口也算成占用，那不是用户说的「被占用」。
-//
-// PortProbe is the one-liner that really binds 127.0.0.1:Port inside that child and exits 0 on
-// success. Only single quotes appear in it: the whole script travels inside the double quotes of
-// -Command, and Inno does not escape anything for us.
-function PortProbe(Port: Integer): String;
-begin
-  Result :=
-    '$s=New-Object System.Net.Sockets.Socket -ArgumentList' +
-    ' ([System.Net.Sockets.AddressFamily]::InterNetwork),' +
-    '([System.Net.Sockets.SocketType]::Stream),' +
-    '([System.Net.Sockets.ProtocolType]::Tcp);' +
-    ' try { $s.Bind((New-Object System.Net.IPEndPoint -ArgumentList' +
-    ' ([System.Net.IPAddress]::Parse(''127.0.0.1''), ' + IntToStr(Port) + ')));' +
-    ' $s.Close(); exit 0 }' +
-    ' catch { $s.Close(); exit 1 }';
-end;
+function WSAStartup(wVersionRequested: Word; var lpWSAData: TWSAData): Integer;
+  external 'WSAStartup@ws2_32.dll stdcall';
+function socket(af, s_type, protocol: Integer): Integer;
+  external 'socket@ws2_32.dll stdcall';
+function bind(s: Integer; var name: TSockAddrIn; namelen: Integer): Integer;
+  external 'bind@ws2_32.dll stdcall';
+function closesocket(s: Integer): Integer;
+  external 'closesocket@ws2_32.dll stdcall';
+function WSAGetLastError: Integer;
+  external 'WSAGetLastError@ws2_32.dll stdcall';
 
-// IsPortFree reports whether 127.0.0.1:Port can still be bound. Any failure to even ask (no
-// PowerShell, a policy block) counts as "not free": refusing is the safe side, and the log line
-// says which step failed.
+// IsPortFree reports whether 127.0.0.1:Port can still be bound. Any failure to even ask (Winsock
+// will not start, no socket) counts as "not free": refusing is the safe side, and the log line says
+// which step failed.
 function IsPortFree(Port: Integer): Boolean;
 var
-  ResultCode: Integer;
+  S, Code, Err: Integer;
 begin
-  if not Exec('powershell.exe',
-              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
-              PortProbe(Port) + '"',
-              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  Result := False;
+  // WSAStartup runs once for the whole install: FreePort walks upwards through this function, so
+  // every call after the first only needs a socket.
+  if not WsaReady then
   begin
-    Log('DSH-AB: cannot run powershell.exe, port ' + IntToStr(Port) + ' cannot be checked');
-    Result := False;
+    WsaReady := WSAStartup($0202, WsaData) = 0;
+    if not WsaReady then
+    begin
+      Log('DSH-AB: WSAStartup failed, port ' + IntToStr(Port) + ' cannot be checked');
+      Exit;
+    end;
+  end;
+  S := socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if S < 0 then
+  begin
+    Log('DSH-AB: socket() failed, port ' + IntToStr(Port) + ' cannot be checked');
     Exit;
   end;
-  Result := ResultCode = 0;
+  ProbeAddr.sin_family := AF_INET;
+  ProbeAddr.sin_port := ((Port and $FF) shl 8) or ((Port shr 8) and $FF);
+  ProbeAddr.sin_addr := $0100007F;
+  ProbeAddr.sin_zero := 0;
+  Code := bind(S, ProbeAddr, 16);
+  Err := 0;
+  // WSAGetLastError is only meaningful while the socket still exists.
+  if Code <> 0 then
+    Err := WSAGetLastError;
+  closesocket(S);
+  Result := Code = 0;
   if not Result then
-    Log('DSH-AB: bind 127.0.0.1:' + IntToStr(Port) + ' failed (exit ' +
-        IntToStr(ResultCode) + '), that port is not usable');
+    Log('DSH-AB: bind 127.0.0.1:' + IntToStr(Port) + ' failed (error ' +
+        IntToStr(Err) + '), that port is not usable');
 end;
 
 // PortIsFree checks the one port this installer asks for and, when it is taken, names it together
@@ -441,7 +564,8 @@ begin
   // the way out of it. The wizard therefore *offers* the first free port above the seeded one and
   // says so on the page. It is behind "not WizardSilent" on purpose: an unattended install must keep
   // failing loudly on an occupied port (InitializeSetup) and must never switch ports behind the
-  // caller's back, which is what verify-silent.ps1 scenario 3 pins.
+  // caller's back, which is what build\py\verify.py pins in scenario 4 (an occupied port has to be
+  // refused in silence).
   if (not WizardSilent) and
      (not PortIsFree(SeedProd, Reason)) and
      FreePort(SeedProd, SeedProd) then
@@ -880,8 +1004,17 @@ begin
       if (FindRec.Name = '.') or (FindRec.Name = '..') then
         Continue;
       Full := AddBackslash(Dir) + FindRec.Name;
+      // A reparse point (a junction or a symbolic link) is not walked into - the same rule as
+      // src\dsh-ab\naming.go's dirSizeBytes, which stops at one with fs.SkipDir. dsh's module fallback
+      // is built out of junctions, so following one can count the same files twice or walk back up
+      // into the parent and never return. $400 is FILE_ATTRIBUTE_REPARSE_POINT and FindFirst already
+      // reports it on the entry itself, so recognising one costs no extra open. The entry's own size
+      // is left out with it, which is what Go's SkipDir does; for a junction that size is 0 anyway.
       if (FindRec.Attributes and $10) <> 0 then
-        Result := Result + DirSizeBytes(Full)
+      begin
+        if (FindRec.Attributes and $400) = 0 then
+          Result := Result + DirSizeBytes(Full);
+      end
       else
         Result := Result + (Int64(FindRec.SizeHigh) shl 32) + Int64(FindRec.SizeLow);
     until not FindNext(FindRec);
@@ -897,47 +1030,86 @@ end;
 // ssPostInstall - where Inno used to write its own entry, i.e. once the files are in place, so a
 // refused or cancelled install never leaves an entry behind. PrivilegesRequired=lowest makes this a
 // per-user entry in HKCU, which is where the installation root and the uninstaller both live.
+// Every write below has its Boolean checked, because the log is read exactly when something is
+// wrong: with a denied or read-only HKCU the key is never created, and an unconditional success
+// line then reported an entry that does not exist. A refused write is therefore reported as a
+// WARN with the count, never as "wrote the entry". The install itself still succeeds - 应用和功能
+// bookkeeping is best effort and nothing else depends on it - only the log line changes.
 procedure WriteUninstallEntry;
 var
   Root, Key: String;
+  Failed: Integer;
 begin
   Root := ExpandConstant('{app}');
   Key := UninstallRegPath;
+  Failed := 0;
   // DisplayName 就是名字本身：不带版本号（版本在 DisplayVersion，系统自己有版本列），也不额外补
   // 括号（括号已经在 InstallName 的返回值里）。
-  RegWriteStringValue(HKCU, Key, 'DisplayName', InstallName(''));
-  RegWriteStringValue(HKCU, Key, 'DisplayVersion', '{#AppVersion}');
-  RegWriteStringValue(HKCU, Key, 'Publisher', '{#AppPublisher}');
-  RegWriteStringValue(HKCU, Key, 'InstallLocation', Root + '\');
-  RegWriteStringValue(HKCU, Key, 'UninstallString', '"' + Root + '\unins000.exe"');
-  RegWriteStringValue(HKCU, Key, 'QuietUninstallString', '"' + Root + '\unins000.exe" /SILENT');
-  RegWriteStringValue(HKCU, Key, 'DisplayIcon', Root + '\{#AppExeName}');
+  if not RegWriteStringValue(HKCU, Key, 'DisplayName', InstallName('')) then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'DisplayVersion', '{#AppVersion}') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'Publisher', '{#AppPublisher}') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'InstallLocation', Root + '\') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'UninstallString', '"' + Root + '\unins000.exe"') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'QuietUninstallString',
+    '"' + Root + '\unins000.exe" /SILENT') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'DisplayIcon', Root + '\{#AppExeName}') then
+    Failed := Failed + 1;
   // 两条快捷方式的落点，交给 DSH-AB 自己维护：它靠这两个值把自己那一条改名，并把旧版留在
   // <Programs>\{#AppName}\ 里的那一条搬出来。不能靠读 .lnk 认领——
   // 外壳把目标路径拆成 shell item 与相对的 LinkInfo 路径，绝对路径在文件里根本不连续（实测），
   // 猜错就会动到别的安装的快捷方式。桌面那条在没勾桌面任务时并不存在，DSH-AB 会自己跳过。
-  RegWriteStringValue(HKCU, Key, 'DshAbStartMenuLink',
-    ExpandConstant('{userprograms}\') + InstallIconPath('') + '.lnk');
-  RegWriteStringValue(HKCU, Key, 'DshAbDesktopLink',
-    ExpandConstant('{autodesktop}\') + DesktopIconPath('') + '.lnk');
-  RegWriteStringValue(HKCU, Key, 'InstallDate', GetDateTimeString('yyyymmdd', ' ', ' '));
+  if not RegWriteStringValue(HKCU, Key, 'DshAbStartMenuLink',
+    ExpandConstant('{userprograms}\') + InstallIconPath('') + '.lnk') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'DshAbDesktopLink',
+    ExpandConstant('{autodesktop}\') + DesktopIconPath('') + '.lnk') then
+    Failed := Failed + 1;
+  if not RegWriteStringValue(HKCU, Key, 'InstallDate', GetDateTimeString('yyyymmdd', ' ', ' ')) then
+    Failed := Failed + 1;
   // EstimatedSize is the "大小" column of 应用和功能 (a DWORD in KB). Windows reads it and computes
   // nothing itself, so an entry without it shows an empty column. Measured from the installed files,
   // rounded up so a real installation never claims 0 KB. A value over 4 GB cannot be expressed in
   // this DWORD - the payload is ~400 MB, and no installation this installer writes comes close.
-  RegWriteDWordValue(HKCU, Key, 'EstimatedSize', (DirSizeBytes(Root) + 1023) div 1024);
-  RegWriteDWordValue(HKCU, Key, 'NoModify', 1);
-  RegWriteDWordValue(HKCU, Key, 'NoRepair', 1);
-  Log('DSH-AB: wrote the Add/Remove entry HKCU\' + Key + ' for ' + Root);
+  if not RegWriteDWordValue(HKCU, Key, 'EstimatedSize', (DirSizeBytes(Root) + 1023) div 1024) then
+    Failed := Failed + 1;
+  if not RegWriteDWordValue(HKCU, Key, 'NoModify', 1) then
+    Failed := Failed + 1;
+  if not RegWriteDWordValue(HKCU, Key, 'NoRepair', 1) then
+    Failed := Failed + 1;
+  // The count alone does not say which of two different things happened, so the line names it:
+  // every write refused (a read-only HKCU) leaves the key uncreated - 应用和功能 shows nothing, and
+  // a partial failure leaves an entry that is really there and really missing values. Only the
+  // key's absence proves nothing was written; a key left by an earlier install survives a run in
+  // which all writes were refused, which is why this cannot be a test on the count.
+  if Failed = 0 then
+    Log('DSH-AB: wrote the Add/Remove entry HKCU\' + Key + ' for ' + Root)
+  else if RegKeyExists(HKCU, Key) then
+    Log('DSH-AB: WARN: could not write ' + IntToStr(Failed) +
+        ' Add/Remove value(s) in HKCU\' + Key + ' for ' + Root +
+        '; the entry exists but is incomplete')
+  else
+    Log('DSH-AB: WARN: could not write ' + IntToStr(Failed) +
+        ' Add/Remove value(s) in HKCU\' + Key + ' for ' + Root +
+        '; no Add/Remove entry was created at all');
 end;
 
 // RecordedLinkPath reads one of the two shortcut paths DSH-AB keeps in its own entry
 // (DshAbStartMenuLink / DshAbDesktopLink, written by WriteUninstallEntry and updated by
-// src\dsh-ab\naming.go whenever the name changes). '' means the value is not there.
+// src\dsh-ab\naming.go whenever the name changes). '' means the value is not there - missing
+// value and failed read alike, because the caller's only question is where the shortcut is. The failed
+// read is logged, so a missing value is visible in the uninstall log instead of silently turning into
+// "there was nothing to remove".
 function RecordedLinkPath(const Value: String): String;
 begin
   Result := '';
-  RegQueryStringValue(HKCU, UninstallRegPath, Value, Result);
+  if not RegQueryStringValue(HKCU, UninstallRegPath, Value, Result) then
+    Log('DSH-AB: WARN: no recorded ' + Value + ' in HKCU\' + UninstallRegPath);
 end;
 
 // RemoveRecordedShortcuts deletes the shortcuts where DSH-AB last put them. The installer's own
@@ -955,6 +1127,8 @@ begin
   begin
     if DeleteFile(Link) then
       Log('DSH-AB: removed the Start menu shortcut ' + Link)
+    else if FileExists(Link) then
+      Log('DSH-AB: WARN: could not remove the Start menu shortcut ' + Link)
     else
       Log('DSH-AB: no Start menu shortcut at ' + Link);
     // 旧版把这一条放进 <Programs>\{#AppName}\，空文件夹顺手删掉；现在它就在根下，所以必须先排掉
@@ -971,6 +1145,8 @@ begin
   begin
     if DeleteFile(Link) then
       Log('DSH-AB: removed the desktop shortcut ' + Link)
+    else if FileExists(Link) then
+      Log('DSH-AB: WARN: could not remove the desktop shortcut ' + Link)
     else
       Log('DSH-AB: no desktop shortcut at ' + Link);
   end;
@@ -985,13 +1161,12 @@ var
   Key: String;
 begin
   Key := UninstallRegPath;
-  if RegKeyExists(HKCU, Key) then
-  begin
-    RegDeleteKeyIncludingSubkeys(HKCU, Key);
-    Log('DSH-AB: removed the Add/Remove entry HKCU\' + Key);
-  end
+  if not RegKeyExists(HKCU, Key) then
+    Log('DSH-AB: no Add/Remove entry to remove at HKCU\' + Key)
+  else if RegDeleteKeyIncludingSubkeys(HKCU, Key) then
+    Log('DSH-AB: removed the Add/Remove entry HKCU\' + Key)
   else
-    Log('DSH-AB: no Add/Remove entry to remove at HKCU\' + Key);
+    Log('DSH-AB: WARN: could not remove the Add/Remove entry HKCU\' + Key);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -1100,56 +1275,165 @@ end;
 //
 // ---- ending this installation's own processes before the uninstall -----------------------------
 // 卸载时问一次「要关闭它并继续卸载吗？」，选「是」就结束这些进程再继续。判定必须按安装
-// 根来——taskkill /IM 会把别的安装（以及别的安装拉起的 node）一起杀掉，而两份安装共存是支持的。
-// 匹配条件因此写成「进程名是 DSH_AB.exe 或 node.exe，且**可执行文件路径**落在本安装根之下」：
-// 安装根里的 unins000.exe 和这次扫描用的 powershell.exe 都不在这两个名字里，不会被自己误杀。
-// 只看路径、不看命令行：命令行里**提到**这个路径的进程（别的安装拉起的 node、跑脚本的 powershell、
-// AI 的会话进程）不是本安装的进程，按命令行匹配就会误杀——2026-09-22 复验实测到过第三个这样的进程。
+// 根来——按名字杀（taskkill /IM DSH_AB.exe）会把别的安装（以及别的安装拉起的 node）一起杀掉，
+// 而两份安装共存是支持的。匹配条件因此写成「进程名是 DSH_AB.exe 或 node.exe，且**可执行文件路径**
+// 落在本安装根之下」：安装根里的 unins000.exe 不在这两个名字里，不会被自己误杀。
+// 只看路径、不看命令行：命令行里**提到**这个路径的进程（别的安装拉起的 node、AI 的会话进程）不是本安装
+// 的进程，按命令行匹配就会误杀——2026-09-22 复验实测到过第三个这样的进程。
 //
-// 只用系统自带的 powershell.exe（不新增任何外部二进制），一次调用干到底：脚本最后 exit 的是匹配到
-// 的进程数，Inno 从 ResultCode 拿到它，静默与交互两条路径都不需要临时文件。
-function KillScript(const Root: String; Kill: Boolean): String;
-var
-  R, Tail: String;
+// 2026-09-22（审计 2）→ 2026-09-25：扫描曾经在 powershell.exe 子进程里用 Get-CimInstance
+// Win32_Process 做，脚本最后的退出码就是匹配数。现在扫描在本进程里做，只用 kernel32：
+// CreateToolhelp32Snapshot 列出全部进程，Process32FirstW / Process32NextW 逐个走，
+// OpenProcess + QueryFullProcessImageNameW 取可执行文件的完整路径。不新增任何外部二进制，也没有
+// 子进程可以失败，静默与交互两条路径都不需要临时文件。
+function CreateToolhelp32Snapshot(dwFlags: Cardinal; th32ProcessID: Cardinal): Cardinal;
+  external 'CreateToolhelp32Snapshot@kernel32.dll stdcall';
+function Process32FirstW(hSnapshot: Cardinal; var lppe: TProcessEntry32W): Boolean;
+  external 'Process32FirstW@kernel32.dll stdcall';
+function Process32NextW(hSnapshot: Cardinal; var lppe: TProcessEntry32W): Boolean;
+  external 'Process32NextW@kernel32.dll stdcall';
+function OpenProcess(dwDesiredAccess: Cardinal; bInheritHandle: Boolean;
+                     dwProcessId: Cardinal): Cardinal;
+  external 'OpenProcess@kernel32.dll stdcall';
+function QueryFullProcessImageNameW(hProcess: Cardinal; dwFlags: Cardinal;
+                                    var lpExeName: TImagePath; var lpdwSize: Cardinal): Boolean;
+  external 'QueryFullProcessImageNameW@kernel32.dll stdcall';
+function TerminateProcess(hProcess: Cardinal; uExitCode: Cardinal): Boolean;
+  external 'TerminateProcess@kernel32.dll stdcall';
+function CloseHandle(hObject: Cardinal): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+function GetLastError: Cardinal;
+  external 'GetLastError@kernel32.dll stdcall';
+
+// IsOwnProductProcessName is the name half of the filter: the two process names a DSH-AB
+// installation can own. One function because the name is read from two places - the full image
+// path, and the snapshot entry when that path is not available.
+function IsOwnProductProcessName(const Name: String): Boolean;
 begin
-  R := AddBackslash(Root);
-  // 用 Inno 自己的 StringChange，而不是 Delphi RTL 的 StringReplace：Pascal Script 里没有后者，
-  // 用了这一整段 [Code] 编译不过（上一轮一次都没编译过，就是这么漏过去的）。单引号用 #39 写，
-  // 不用把引号写成四个连在一起——那正是这段代码以前最容易读错的地方。
-  StringChange(R, #39, #39 + #39);
-  if Kill then
-    // PowerShell 的 if 必须带括号：`if $n -gt 0 {…}` 是 ParserError，不是「条件为假」。2026-09-22
-    // 真机验证就是栽在这里——脚本一行都没跑成、退出码 1，被调用方当成「匹配到 1 个进程」，日志于是
-    // 写「结束了…共 1 个」而一个进程都没结束。
-    Tail := '; if ($n -gt 0) { $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }'
-  else
-    Tail := '';
-  Result :=
-    '$r=''' + R + '''; $n=0;' +
-    ' try { $p=@(Get-CimInstance Win32_Process | Where-Object {' +
-    ' ($_.Name -eq ''DSH_AB.exe'' -or $_.Name -eq ''node.exe'') -and' +
-    ' ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) });' +
-    ' $n=$p.Count' + Tail + ' } catch { exit -1 }; exit $n';
+  Result := (CompareText(Name, 'DSH_AB.exe') = 0) or (CompareText(Name, 'node.exe') = 0);
 end;
 
-// OwnRunningProcesses runs that scan; with Kill it also ends what it found. It returns the number
-// of processes it matched, or -1 when the scan could not run at all (no PowerShell, a policy block,
-// or the script itself failed): -1 must never be read as "nothing is running". That is why the scan
-// exits -1 from its own catch instead of turning a failure into the count 0.
-function OwnRunningProcesses(const Root: String; Kill: Boolean): Integer;
+// ProcessEntryName is the szExeFile field of the entry the walk is standing on: the fallback name
+// for a process whose executable path could not be read.
+function ProcessEntryName: String;
 var
-  ResultCode: Integer;
+  I: Integer;
+  C: Char;
 begin
-  if not Exec('powershell.exe',
-              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
-              KillScript(Root, Kill) + '"',
-              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  Result := '';
+  I := 0;
+  while I < MAX_PATH do
   begin
-    Log('DSH-AB: 无法运行 powershell.exe 检查本安装根下的进程');
-    Result := -1;
+    C := ScanEntry.ExeFile[I];
+    if C = #0 then
+      Break;
+    Result := Result + C;
+    I := I + 1;
+  end;
+end;
+
+// ImagePathName reads the NUL-terminated path QueryFullProcessImageNameW wrote into ImagePath.
+function ImagePathName: String;
+var
+  I: Integer;
+  C: Char;
+begin
+  Result := '';
+  I := 0;
+  while I < EXE_PATH_CHARS do
+  begin
+    C := ImagePath.Chars[I];
+    if C = #0 then
+      Break;
+    Result := Result + C;
+    I := I + 1;
+  end;
+end;
+
+// KillOwnProcess ends one matched process through a handle of its own: the one the scan holds was
+// opened for querying and carries no PROCESS_TERMINATE.
+procedure KillOwnProcess(Pid: Cardinal);
+var
+  Proc: Cardinal;
+begin
+  Proc := OpenProcess(PROCESS_TERMINATE, False, Pid);
+  if Proc = 0 then
+  begin
+    Log('DSH-AB: 无法结束 PID ' + IntToStr(Pid) + '（OpenProcess 失败，错误 ' +
+        IntToStr(GetLastError) + '）');
     Exit;
   end;
-  Result := ResultCode;
+  TerminateProcess(Proc, 1);
+  CloseHandle(Proc);
+end;
+
+// OwnRunningProcesses walks the process list and counts the processes whose name is DSH_AB.exe or
+// node.exe and whose executable path is under Root; with Kill it also ends every one of them. It
+// returns that count, or -1 when the scan could not run at all: -1 must never be read as "nothing is
+// running", so every way the walk can fail to start leaves -1 behind and only a finished walk
+// reports a count. Kill failures are not counted and not retried - the caller only needs to know
+// what is there, and the uninstall's leftover list names anything it could not delete.
+function OwnRunningProcesses(const Root: String; Kill: Boolean): Integer;
+var
+  Snap, Proc, Pid: Cardinal;
+  Size: Cardinal;
+  Name, Path, Prefix: String;
+  Count: Integer;
+begin
+  Result := -1;
+  Snap := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if Snap = INVALID_HANDLE_VALUE then
+  begin
+    Log('DSH-AB: CreateToolhelp32Snapshot 失败（错误 ' + IntToStr(GetLastError) +
+        '），无法检查本安装根下的进程');
+    Exit;
+  end;
+
+  // Every process of this installation lives under the root, so the comparison is against the root
+  // plus a separator: the old filter's StartsWith(AddBackslash(Root), OrdinalIgnoreCase).
+  Prefix := AddBackslash(Root);
+  Count := 0;
+  ScanEntry.SizeAndUsage := PROCESSENTRY32W_SIZE;
+  if not Process32FirstW(Snap, ScanEntry) then
+  begin
+    Log('DSH-AB: Process32FirstW 失败（错误 ' + IntToStr(GetLastError) +
+        '），无法检查本安装根下的进程');
+    CloseHandle(Snap);
+    Exit;
+  end;
+  repeat
+    Pid := Cardinal(ScanEntry.PidAndHeapId);
+    Proc := OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, Pid);
+    if Proc <> 0 then
+    begin
+      ImagePath.Chars[0] := #0;
+      Size := EXE_PATH_CHARS;
+      if QueryFullProcessImageNameW(Proc, 0, ImagePath, Size) then
+      begin
+        Path := ImagePathName;
+        Name := ExtractFileName(Path);
+        // Both halves of the old filter have to hold: the name, and the path under this
+        // installation's root. A name alone is not enough - the path is what proves the process
+        // belongs to this installation, and without it the answer stays "not ours", which is the
+        // same answer the old filter gave for a null ExecutablePath.
+        if IsOwnProductProcessName(Name) and
+           (CompareText(Copy(Path, 1, Length(Prefix)), Prefix) = 0) then
+        begin
+          Count := Count + 1;
+          if Kill then
+            KillOwnProcess(Pid);
+        end;
+      end
+      else if IsOwnProductProcessName(ProcessEntryName) then
+        // Said out loud rather than skipped in silence: a process carrying one of our two names
+        // could not be located on disk, so it is left alone.
+        Log('DSH-AB: 读不到 PID ' + IntToStr(Pid) + ' 的路径，跳过 ' + ProcessEntryName);
+      CloseHandle(Proc);
+    end;
+    ScanEntry.SizeAndUsage := PROCESSENTRY32W_SIZE;
+  until not Process32NextW(Snap, ScanEntry);
+  CloseHandle(Snap);
+  Result := Count;
 end;
 
 // UserDataDeleteRequested 读卸载器自己的命令行开关 /DELETEUSERDATA=1（大小写不敏感）。
@@ -1196,12 +1480,12 @@ begin
       end;
     end
     else if Running < 0 then
-      Log('DSH-AB: 跳过了运行中进程的检查（无法运行 powershell.exe）');
+      Log('DSH-AB: 跳过了运行中进程的检查（枚举本机进程失败）');
 
     // Keep by default. SuppressibleMsgBox answers itself with the
     // default button — IDNO, keep the data — so a silent uninstall never blocks and never deletes.
     // 静默卸载答的永远是那个默认按钮，这也是「删」这一路以前测不到的原因：/DELETEUSERDATA=1 带了就
-    // 照做、不再问，脚本因此能真的跑一遍删除（verify-silent.ps1 的场景 2）。
+    // 照做、不再问，脚本因此能真的跑一遍删除（build\py\verify.py 的场景 2）。
     DeleteUserData := UserDataDeleteRequested();
     if not DeleteUserData then
       DeleteUserData := SuppressibleMsgBox('要同时删除 DSH-AB 的用户数据吗？' + #13#10 + #13#10 +

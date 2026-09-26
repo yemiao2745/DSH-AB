@@ -19,7 +19,11 @@ extra_args        = []     # 追加到 dsh 命令行
 env               = {}     # 追加环境变量（DSH_HOME 由程序按槽设置，不可覆盖）
 start_timeout_s   = 60     # 启动后等端口通的上限
 probe_interval_ms = 500    # 端口探测间隔
-stop_grace_s      = 10     # 重启时等进程退出的宽限
+# 结束子进程前先等这段时间的宽限（只对单进程路生效）。kill_tree = true（出厂值）时整条进程树由作业对象
+# 一次结束（TerminateJobObject），不等待这段时间：本程序的 dsh 是无控制台子进程，非强制终止请求没有消息
+# 循环可送达、必然失败（实测 exit 128），那时根本没有可等的「非强制」一次。作业对象没接住这个子进程时才
+# 回落到单进程路。到底走了哪条路，日志里那行 INFO 会写明。
+stop_grace_s      = 10
 kill_tree         = true   # 结束整个子进程树
 
 [tray]
@@ -28,7 +32,7 @@ icon    = "embedded"   # embedded | 路径
 labels  = { open = "打开浏览器", status = "当前状态", log = "log：{level}", rollback = "槽位切换", restart = "重启", exit = "退出" }
 
 [logs]
-level       = "auto"   # off 只记 error | auto 再加 warn/debug | full 全记（含子进程输出）；托盘 log 项循环这三档
+level       = "auto"   # off 只记 error | auto 再加 info/warn（干净启动也留下启动横幅与端口就绪行）| full 全记（再加 debug 与 dsh 子进程输出）；托盘 log 项循环这三档
 dir         = "logs"
 max_files   = 20       # 日志保留份数
 max_size_mb = 5        # 单个日志文件上限

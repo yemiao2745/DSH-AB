@@ -1,6 +1,28 @@
-# DSH-AB 的基线仓库：只提交配置与状态。
-# 槽位是完整的 dsh 实例，runtime\ 放随包的 Git，logs\ 是可丢弃的日志。
-slot-a/
-slot-b/
+# 安装根一个仓库（决策 D：三个仓库合并成一个）。槽位是完整的 dsh 实例，
+# 所以只提交配置、数据里的文字内容与随包的说明文档；运行时与日志都不提交。
+# 节点运行时、dsh 应用树与依赖闭包太大，永远不进仓库。
+slot-*/node/
+slot-*/app/
+**/node_modules/
+# dsh 的运行时数据：会话、存储、附件、凭据、缓存、快照、溢出文件。
+slot-*/data/sessions*/
+# meow-memory 的 SQLite 长期记忆库（运行时数据，不进仓库；工作区可以是槽根、也可以是安装根）
+slot-*/.dsh-meow/
+/.dsh-meow/
+slot-*/data/storages/
+slot-*/data/attachments/
+slot-*/data/auth/
+slot-*/data/llm-*/
+slot-*/data/change-ledger/
+slot-*/data/undo-snapshots/
+slot-*/data/spill/
+slot-*/data/.credentials.yaml
+slot-*/data/profiles/*/.dsh-market/
+slot-*/data/profiles/*/.dsh-module-fallback/
 runtime/
 logs/
+*.log
+# 槽位副本的固定落点（换槽时把旧树挪到这里，不进仓库）
+slot-archive/
+# 就地升级时占位用的旧 exe：运行中的 DSH_AB.exe 会占着它，重启前删不掉，也不该进仓库。
+DSH_AB.exe.old

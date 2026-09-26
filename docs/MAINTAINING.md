@@ -7,21 +7,37 @@ deliberately not uploaded.
 
 ## Build
 
-    pwsh -NoProfile -File build\build.ps1 -DshVersion <dsh version> [-Offline]
-    pwsh -NoProfile -File build\verify-silent.ps1 [-Setup <installer>] [-Iss <repo>\installer\dsh-ab.iss]
-    payload\slot-a\node\node.exe build\verify-skill.mjs [skills root]
+The toolchain is Python: tools/python/python.exe, the portable interpreter kept inside the repository (git-ignored,
+so the CI jobs that run it provision the same build into tools/python/ first). Every path is relative to
+the repository root, and the toolchain calls no PowerShell, cmd, reg or taskkill. Three entry points:
 
-build.ps1 runs five steps - resource, Go build (both versions injected by -ldflags), payload, Inno Setup
-compile, update pack - each with its own switch, documented in that script's header. Both verify-silent.ps1
-defaults (the temporary installation directory and the .iss it gates) come from the script's own location, so a
-clone anywhere runs unchanged; -Iss is only needed for a .iss outside this repository.
+    tools/python/python.exe build/py/build.py --dsh-version <dsh version> [--offline]
+    tools/python/python.exe build/py/verify.py [--setup <installer>] [--iss <repo>/installer/dsh-ab.iss]
+    tools/python/python.exe build/py/dshab_verify/verify_skill.py [skills root]
 
-verify-silent.ps1 runs verify-skill.mjs, then asserts the installation as a whole: the root's file set against the
-build-time record in the payload manifest, the three baked files (the skill, docs\PLUGINS.md, docs\TODO.md)
-verbatim once the placeholder is replaced, the exe hash, the port, the uninstall entry with its EstimatedSize, and
-nothing left to restore. It installs into a temporary directory on a port of its own (the /PRODUCTION= value in the
-script: a silent install shows no ports page); it may run while the user's own installation runs, but its port has
-to be free - the installer binds 127.0.0.1 and refuses a taken port.
+build.py runs five steps - icon/manifest resource, Go build (both versions injected by -ldflags, then go vet, the
+PE-subsystem check and a --version read-back), payload, Inno Setup compile, update pack - each with its own switch
+(--skip-payload, --skip-installer, --skip-update-pack, --program-only, --test-product, --node-version,
+--git-version, --registry, --dshab-version, --offline), all documented by build/py/build.py --help. The verifier's
+defaults (the temporary installation directory, the .iss it gates, and the setup name it derives from the payload
+manifest) come from the verifier's own location, so a clone anywhere runs unchanged; --iss is only needed for a
+.iss outside this repository. The update pack is decided
+by --skip-update-pack alone, never by --skip-installer.
+
+verify.py runs the bundled-skill check (build/py/dshab_verify/verify_skill.py) and then asserts the installation as
+a whole: the thirteen source-level gates over installer/dsh-ab.iss and naming.go (one implementation, shared with
+the build: build/py/dshab_build/isscheck.py), the root's file set against the build-time record in the payload
+manifest, the three baked files (the skill, docs/PLUGINS.md, docs/TODO.md) verbatim once the placeholder is
+replaced, the exe hash, the port, the uninstall entry with its EstimatedSize, and nothing left to restore. It
+installs into a temporary directory on a port of its own (3190 unless --port says otherwise: a silent install shows
+no ports page); it may run while the user's own installation runs, but its port has to be free - the installer binds
+127.0.0.1 and refuses a taken port. Every assertion, the commands run and the log paths land in
+.tmp-verify/report.txt.
+
+Neither build.py nor verify.py provisions a toolchain: the Go compiler is expected at tools/go/bin/go.exe
+(build/py/dshab_build/paths.py) and ISCC.exe under %LOCALAPPDATA%/Programs/Inno Setup 6
+(build/py/dshab_build/iscc.py). The developer puts both there; CI does the same, from the versions pinned once in
+.github/workflows/build-dsh-ab.yml.
 
 ## Verification reports
 
@@ -31,9 +47,9 @@ it. Clean up the test installations and file the report: two separate things, bo
 
 ## Test build (a second, independent product)
 
-    pwsh -NoProfile -File build\build.ps1 -DshVersion <dsh version> -TestProduct
+    tools/python/python.exe build/py/build.py --dsh-version <dsh version> --test-product
 
--TestProduct builds the very same source as the product **DSH-ABtest**: one switch changes the installer's AppName,
+--test-product builds the very same source as the product **DSH-ABtest**: one switch changes the installer's AppName,
 its default installation directory, the Start Menu entry name, the Add/Remove DisplayName prefix, the Go appName
 constant (injected with -ldflags -X; the value in the source is the default) and the artifact name. Every
 name-related place carries the product suffix, so a test installation stays apart from a DSH-AB that is already
@@ -44,8 +60,9 @@ Both sides scan "the other installations on this machine" by one rule - the firs
 product name - so an entry naming another product of the family (DSH-AB vs DSH-ABtest) does not belong to this one,
 the DSH_AB.exe fallback included, because both products ship that same exe name. naming.go's isDshAbEntry and
 dsh-ab.iss's IsOwnProductEntry are that one rule on two sides - one Go, one Pascal, so the rule matches and the text
-cannot - and naming_test.go plus verify-silent.ps1 pin it. A test build implies -SkipPayload (it takes the exe from
-build\DSH_ABtest.exe and leaves the release artifacts alone), so run a normal build once first.
+cannot - and naming_test.go plus the acceptance run pin it (build/py/verify.py). A test build implies
+--skip-payload (it takes the exe from build/DSH_ABtest.exe and leaves the release artifacts alone), so run a normal
+build once first.
 
 ## Tests, and a new dsh version
 
@@ -56,30 +73,30 @@ The Go module root is src\dsh-ab, not the repository root:
     tools\go\bin\go.exe vet ./...
     tools\go\bin\go.exe test ./... -count=1
 
-CI runs the same go test ./... -count=1 with the toolchain build.ps1 uses, and a failing test blocks the offline
-build as well as the release. No version list is written down in this repository: the workflow's discover job finds
-the upstream dsh-v* releases itself, and a dispatch may pass dsh_versions=0.1.5-rc.2,0.1.2-rc.1 to build a subset.
-Locally: build.ps1 -DshVersion <version> then verify-silent.ps1 - the artifact name, the payload's file record and
-the two versions compiled into the exe have to agree (build.ps1 reads both back out of the built exe, dsh-ab.iss
-names the artifact from them, verify-silent.ps1 gates that name).
+CI runs the same go test ./... -count=1 with the toolchain build.py compiles with, and a failing test blocks the
+offline build as well as the release. No version list is written down in this repository: the workflow's discover
+job finds the upstream dsh-v* releases itself, and a dispatch may pass dsh_versions=0.1.5-rc.2,0.1.2-rc.1 to build
+a subset. Locally: build/py/build.py --dsh-version <version> then build/py/verify.py - the artifact name, the
+payload's file record and the two versions compiled into the exe have to agree (build.py reads both back out of the
+built exe, dsh-ab.iss names the artifact from them, verify.py gates that name).
 
 ## In-place update (the update pack)
 
 Updating DSH-AB on a machine that already has one does not go through the installer: the installer refuses a
 non-empty directory, and there is no overwrite upgrade. The update path is a separate artefact:
 
-    build\build.ps1 -DshVersion <dsh version>      # step 5/5 also writes dist\<product>-<dshab>-update.zip
+    tools/python/python.exe build/py/build.py --dsh-version <dsh version>   # step 5/5 also writes dist/<product>-<dshab>-update.zip
 
-build\mkupdate.ps1 assembles it out of the very same payload\ the installer is compiled from, minus the slots,
-minus dsh-ab.toml (the user's ports and log settings) and minus docs\: both ledgers are the installation's own
-accumulated record, so no pack overwrites them (baking the installation root into them is the installer's job, and
-only for a fresh installation). dsh itself lives inside the slots, so the pack does not depend on the dsh version
-it was built next to: one pack per DSH-AB version. CI builds it in its standalone update-pack job (-SkipInstaller
-still runs step 5/5; -SkipUpdatePack is the only switch that skips it) and publish puts it into the release. **No
-script ships with it**: the process is written down as rules in the skill the installer already ships, section
-"Updating DSH-AB itself", and the AI maintaining the installation carries it out. Rolling back is the snapshot
-taken before the update (git reset --hard <that snapshot>): the snapshot tracks the program files and docs\, and
-also dsh-ab.toml and state\ (.gitignore leaves out only the two slots, runtime\ and logs\).
+build/py/dshab_build/mkupdate.py assembles it out of the very same payload/ the installer is compiled from, minus
+the slots, minus dsh-ab.toml (the user's ports and log settings) and minus docs/: both ledgers are the
+installation's own accumulated record, so no pack overwrites them (baking the installation root into them is the
+installer's job, and only for a fresh installation). dsh itself lives inside the slots, so the pack does not depend
+on the dsh version it was built next to: one pack per DSH-AB version. CI builds it in its standalone update-pack job
+(--skip-installer still runs step 5/5; --skip-update-pack is the only switch that skips it) and publish puts it into
+the release. **No script ships with it**: the process is written down as rules in the skill the installer already
+ships, section "Updating DSH-AB itself", and the AI maintaining the installation carries it out. Rolling back is
+the snapshot taken before the update (git reset --hard <that snapshot>): the snapshot tracks the program files and
+docs/, and also dsh-ab.toml and state/ (.gitignore leaves out only the two slots, runtime/ and logs/).
 
 ## Production port
 
@@ -110,12 +127,15 @@ it is taken, while the wizard pre-fills the first free port (behind not WizardSi
 - **The uninstaller reports what it could not delete** (RemoveAll collects every leftover, CurUninstallStepChanged
   prints 「以下没删掉，请手动删除」), and a silent uninstall writes that report into its log.
 - **The payload's relative layout is what has to stay short**: ISCC and Windows cannot create a path longer than
-  MAX_PATH, so mkpayload.ps1 gates the longest relative path at 180 characters (it prints the worst path and stops
-  the build past it), and the --before pin on the fresh npm resolve keeps the dependency family at one generation so
-  the tree stays flat. Measure the built payload before touching either - the history is in those code comments.
-- **build\verify-skill.mjs resolves @deepseek-ai/dsh-skill instead of assuming a layout** (Node's own resolution
-  first, two concrete fallbacks, a genuine miss reported); its assertions - non-empty frontmatter, the kebab-case
-  name, the nine trigger words - stay as they are.
+  MAX_PATH, so build/py/dshab_build/filetime.py gates the longest relative path at 180 characters (it prints the
+  worst path and stops the build past it), and the --before pin on the fresh npm resolve keeps the dependency family
+  at one generation so the tree stays flat. Measure the built payload before touching either - the history is in
+  those code comments.
+- **build/py/dshab_verify/verify_skill.py is the whole skill check in Python** (it replaced the old Node-based
+  checker, so no Node and no @deepseek-ai/dsh-skill are needed): non-empty frontmatter, the kebab-case name, the
+  nine trigger words, and a body carrying either the {{DSH_AB_ROOT}} placeholder or an already baked absolute
+  path. It resolves the app tree the old way (DSHAB_APP, else payload/slot-a/app, else slot-a/app) and needs it
+  to exist, so run a build first when calling it on its own.
 - **Three separate subagents**: the one that writes a change does not verify it, an independent one does, and
   another audits the whole change for bugs and for what could be simplified or deleted - each in its own run, all
   of them before anything is published.

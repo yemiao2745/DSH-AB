@@ -8,7 +8,7 @@ package main
 //   * 本机只有这一份，且端口可用            → DSH-AB
 //   * 本机有别的份，本份端口可用且不冲突    → DSH-AB (<ports.production>)
 //   * 端口不可用，或与别的份的端口相同      → DSH-AB (<tag>) + 一次弹窗请用户改端口
-// 测试构建（build\build.ps1 -TestProduct）把 appName 换掉，三种形态同样多一个「test」：
+// 测试构建（build/py/build.py --test-product）把 appName 换掉，三种形态同样多一个「test」：
 // DSH-ABtest / DSH-ABtest (<端口>) / DSH-ABtest (<tag>)。
 // 「端口不可用」= 试绑 127.0.0.1:<ports.production> 失败。本份的 dsh 只可能由本份的托盘拉起，
 // 而名字在托盘启动 dsh 之前算出来，所以此刻这个端口上真有程序在听，就一定是别的进程（另一份安装
@@ -56,7 +56,7 @@ const (
 )
 
 // appName is [Setup] AppName, and a variable rather than a constant on purpose: a test build is a
-// separate product (DSH-ABtest), and build\build.ps1 injects that name here with -ldflags -X. The
+// separate product (DSH-ABtest), and build/py/build.py injects that name here with -ldflags -X. The
 // name below is the release product's and is never edited per build.
 var appName = "DSH-AB"
 

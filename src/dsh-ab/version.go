@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// dshabVersion and dshVersion are baked in at build time by build/build.ps1:
+// dshabVersion and dshVersion are baked in at build time by build/py/build.py:
 //
 //	-ldflags "-X main.dshabVersion=<dshab> -X main.dshVersion=<dsh>"
 //
@@ -36,7 +36,7 @@ func effectiveDshabVersion() string {
 // One shape, no branches: every build injects a dsh version. The in-place update pack
 // carries the very same exe the installer does, so there is no longer a build that has no
 // dsh to name - the empty-dsh branch this used to have existed only for the pack's own
-// separately built exe (build.ps1), and it went away with that build.
+// separately built exe (build/py/build.py), and it went away with that build.
 func versionText(dshab, dsh string) string {
 	return "DSH-AB " + strings.TrimSpace(dshab) + " (dsh " + strings.TrimSpace(dsh) + ")"
 }
@@ -46,11 +46,9 @@ func versionText(dshab, dsh string) string {
 // built exe which versions it carries never opens a window and never trips the
 // "already running" popup.
 func handleVersionFlag(args []string, out io.Writer) bool {
-	for _, a := range args {
-		if a == "--version" || a == "-v" {
-			fmt.Fprintln(out, versionText(effectiveDshabVersion(), dshVersion))
-			return true
-		}
+	if what, _ := classifyCommandLine(args); what == printVersion {
+		fmt.Fprintln(out, versionText(effectiveDshabVersion(), dshVersion))
+		return true
 	}
 	return false
 }

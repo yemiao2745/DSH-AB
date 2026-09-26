@@ -4,11 +4,18 @@
 # THIS WORKFLOW CANNOT BE VALIDATED ON THE DEVELOPMENT MACHINE. Its first real run happens on
 # GitHub, and the first run is the experiment: watch it in the Actions tab.
 #
-# Checked locally: the YAML parses; every local command in it is the same one that is known to
-# work there (go test ./... -count=1 in src\dsh-ab, build\build.ps1 -DshVersion <ver> [-Offline],
-# build\verify-silent.ps1, and the discover block run against fed-in version and asset lists);
-# every PowerShell block in it parses. NOT checked: the runner image, the toolchain download URLs,
-# actions/setup-go, the upstream API responses, the cache behaviour and the release publication.
+# Checked locally: the YAML parses; every project command in it is the relative-path Python
+# command that is known to work there (tools/python/python.exe build/py/build.py --dsh-version
+# <ver> [--offline], tools/python/python.exe build/py/verify.py). NOT checked: the runner image,
+# the toolchain download URLs, actions/setup-go, the upstream API responses, the cache behaviour
+# and the release publication.
+#
+# Every run block is "shell: python": the default shell on windows-latest is pwsh, and this
+# repository runs no PowerShell, cmd, reg or taskkill at all. Two kinds of block: the CI glue
+# (discover, publishing) runs on the interpreter actions/setup-python installs, while the steps
+# that build and verify call the project's own interpreter, tools/python/python.exe. tools/ is
+# git-ignored, so every job that needs it takes its own copy of the very same portable build -
+# the pins for the interpreter, Go and Inno Setup live once, in the env: block below.
 #
 # Release shape: the tag is dshab-<DSH-AB version>, so one DSH-AB version owns exactly one release
 # and every installer is an asset of it. A (DSH-AB, dsh) pair whose asset is already there is
@@ -20,7 +27,7 @@
 #
 # Credentials: the implicit GITHUB_TOKEN (permissions: contents: write below). No repository secret
 # is configured and none is needed. This repository never contains, reads or prints
-# .secrets\github.toml - that file is git-ignored and stays on the development machine.
+# .secrets/github.toml - that file is git-ignored and stays on the development machine.
 # ---------------------------------------------------------------------------------------------
 
 name: build-dsh-ab
@@ -49,6 +56,28 @@ concurrency:
   group: build-dsh-ab
   cancel-in-progress: false
 
+env:
+  # The one place the toolchain versions and their hashes are written down. PYTHON_VERSION is the
+  # same portable build the development machine keeps in tools/python (the official embeddable
+  # CPython package, python-<version>-embed-amd64.zip); GO_VERSION is the release
+  # build/py/dshab_build/build_exe.py compiles with and the one actions/setup-go installs in the
+  # test job.
+  #
+  # Every toolchain download is checked against its sha256 before it is extracted, so a swapped or
+  # truncated archive fails the job instead of being linked into the artifacts:
+  #   PYTHON_SHA256      computed from the archive at that exact URL (11133606 bytes; python.org
+  #                      publishes no checksum next to the embeddable package)
+  #   GO_SHA256          computed from the archive at that exact URL and confirmed by a second,
+  #                      independent download of the same URL (87052317 bytes)
+  #   INNO_SETUP_SHA256  the hash tools/downloads/downloads.json records for this exact URL,
+  #                      re-checked against the copy held in tools/downloads (10592232 bytes)
+  PYTHON_VERSION: '3.12.10'
+  PYTHON_SHA256: '4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3'
+  GO_VERSION: '1.24.0'
+  GO_SHA256: '96b7280979205813759ee6947be7e3bb497da85c482711116c00522e3bb41ff1'
+  INNO_SETUP_VERSION: '6.7.3'
+  INNO_SETUP_SHA256: '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+
 jobs:
   discover:
     name: discover upstream dsh versions
@@ -58,7 +87,7 @@ jobs:
       has_work: ${{ steps.rc.outputs.has_work }}
       # 更新包与 dsh 版本无关（Release 里就一份），缺了这一份也算有工作要做。
       update_pack_needed: ${{ steps.rc.outputs.update_pack_needed }}
-      # 更新包那个 job 要传一个 dsh 版本给 build.ps1（随包那份 exe 里编着它），但那个 job 不解析
+      # 更新包那个 job 要传一个 dsh 版本给 build.py（随包那份 exe 里编着它），但那个 job 不解析
       # 任何 dsh 树，所以这只是个标签，不是「要取到那份 dsh」。
       pack_dsh_version: ${{ steps.rc.outputs.pack_dsh_version }}
       dshab: ${{ steps.rc.outputs.dshab }}
@@ -67,123 +96,138 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
+      - name: Provide the interpreter for the CI glue (actions/setup-python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: List the upstream releases this release does not carry yet
         id: rc
-        shell: pwsh
+        shell: python
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MANUAL_VERSIONS: ${{ github.event.inputs.dsh_versions }}
           DISPATCH_VERSIONS: ${{ github.event.client_payload.dsh_versions }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          import json, os, re, sys, urllib.error, urllib.request
 
-          $headers = @{ 'User-Agent' = 'dsh-ab-ci'; 'Accept' = 'application/vnd.github+json' }
-          if ($env:GH_TOKEN) { $headers['Authorization'] = "Bearer $($env:GH_TOKEN)" }
+          token = os.environ.get("GH_TOKEN") or ""
+          headers = {"User-Agent": "dsh-ab-ci", "Accept": "application/vnd.github+json"}
+          if token:
+              headers["Authorization"] = "Bearer " + token
 
-          # This program's version and its one release tag. The value is read from
-          # src\dsh-ab\VERSION - the file build\mkpayload.ps1 reads into payload-manifest.json's
-          # dshab_version. That manifest is git-ignored and does not exist yet at this point, so the
-          # version is taken at its source instead of being written down here.
-          $dshab = (Get-Content -LiteralPath 'src\dsh-ab\VERSION' -Raw).Trim()
-          if (-not $dshab) { throw 'src\dsh-ab\VERSION 是空的' }
-          $tag = "dshab-$dshab"
-          Write-Host "dshab $dshab -> release $tag"
+          def api(url):
+              request = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  return json.load(response)
 
-          # Upstream tags look like dsh-v<version>; the version without that prefix is the npm
-          # version the payload is built from. One matrix cell per release, on every channel: an
-          # alpha, an rc and a final release without a suffix are all accepted - the channel a
-          # version is on is not this workflow's business, only that the version exists.
-          $requested = if ($env:MANUAL_VERSIONS) { $env:MANUAL_VERSIONS } else { $env:DISPATCH_VERSIONS }
-          $versions = @()
-          if ($requested) {
-            Write-Host "versions asked for by the trigger: $requested"
-            foreach ($v in ($requested -split '[,\s]+')) {
-              if ($v) { $versions += ($v.Trim() -replace '^dsh-v', '') }
-            }
-          } else {
-            $uri = 'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=100'
-            $releases = Invoke-RestMethod -Uri $uri -Headers $headers
-            foreach ($rel in @($releases)) {
-              # Assigned per iteration, so $Matches always belongs to the tag just matched.
-              if ($rel.tag_name -match '^dsh-v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') { $versions += $Matches[1] }
-            }
-          }
+          # 本程序的版本与它那一个 Release tag。值取自 src/dsh-ab/VERSION——build/py/dshab_build/paths.py
+          # 读进 payload 清单 dshab_version 的同一个文件。清单是 git-ignored、此刻还不存在，所以版本在
+          # 源头取，而不是在这里写死。
+          with open("src/dsh-ab/VERSION", encoding="utf-8") as handle:
+              dshab = handle.read().strip()
+          if not dshab:
+              sys.exit("src/dsh-ab/VERSION 是空的")
+          tag = "dshab-" + dshab
+          print("dshab %s -> release %s" % (dshab, tag))
 
-          $versions = @($versions | Sort-Object -Unique)
-          if ($versions.Count -eq 0) { throw 'no dsh version found (upstream API, or the list the trigger asked for)' }
-          Write-Host "$($versions.Count) dsh version(s): $($versions -join ', ')"
+          # 上游 tag 形如 dsh-v<version>；去掉前缀就是载荷要装的那个 npm 版本。一个 Release 一格，所有
+          # 通道都算：alpha、rc 与不带后缀的正式版都接受——版本在哪个通道不是本工作流的事，只要它存在。
+          requested = os.environ.get("MANUAL_VERSIONS") or os.environ.get("DISPATCH_VERSIONS") or ""
+          versions = []
+          if requested.strip():
+              print("versions asked for by the trigger: %s" % requested)
+              for piece in requested.replace(",", " ").split():
+                  versions.append(re.sub("^dsh-v", "", piece))
+          else:
+              uri = "https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=100"
+              for release in api(uri):
+                  # 逐次匹配，$Matches 那种「上一轮残留」的问题在 Python 里不存在。
+                  match = re.match("^dsh-v([0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?)$", release["tag_name"])
+                  if match:
+                      versions.append(match.group(1))
+          versions = sorted(set(versions))
+          if not versions:
+              sys.exit("no dsh version found (upstream API, or the list the trigger asked for)")
+          print("%d dsh version(s): %s" % (len(versions), ", ".join(versions)))
 
-          # An asset of the release is what says "this (DSH-AB, dsh) pair is published": the name
-          # is the one build\build.ps1 gives the installer. A release that is not there yet answers
-          # 404 and counts as nothing published.
-          function Get-AssetName([string]$DshVersion) { "DSH-AB-$dshab-$DshVersion-setup.exe" }
-          $existing = @()
-          $release = $null
-          try {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" -Headers $headers
-          } catch {
-            # 只有 404 才等于「这个 Release 还不存在」。403 / 429 / 5xx / 网络故障以前也被当成它，
-            # 于是 asset 清单空转成「一个都没发布」：一次限流就能把日常空跑变成整轮 12 格全量重建，
-            # 并把内容相同的安装包再 --clobber 传一遍。别的失败一律往上抛，让这一轮红掉而不是乱建。
-            $status = 0
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-            if ($status -ne 404) { throw }
-            Write-Host "release $tag does not exist yet: $($_.Exception.Message)"
-          }
+          # Release 里的 asset 才是「这一对 (DSH-AB, dsh) 已发布」的凭据：名字就是 build.py 给安装包起的
+          # 那个。还不存在的 Release 应答 404，等于什么都还没发布。
+          def asset_name(dsh_version):
+              return "DSH-AB-%s-%s-setup.exe" % (dshab, dsh_version)
+
+          existing = []
+          release = None
+          try:
+              release = api("https://api.github.com/repos/%s/releases/tags/%s"
+                            % (os.environ["GITHUB_REPOSITORY"], tag))
+          except urllib.error.HTTPError as exc:
+              # 只有 404 才等于「这个 Release 还不存在」。403 / 429 / 5xx / 网络故障以前也被当成它，
+              # 于是 asset 清单空转成「一个都没发布」：一次限流就能把日常空跑变成整轮 12 格全量重建，
+              # 并把内容相同的安装包再 --clobber 传一遍。别的失败一律往上抛，让这一轮红掉而不是乱建。
+              if exc.code != 404:
+                  raise
+              print("release %s does not exist yet: %s" % (tag, exc))
           # asset 清单单独取，不靠 Release 响应里那一小块，而且按 release id 取、翻页取：publish 读同一个
           # Release 的 asset 用的是 .../releases/<id>/assets --paginate，这里只看第一页就是两处口径不一致，
           # asset 一多「已发布」的判定会静默少数，同一份安装包被反复重建重传。（/releases/tags/<tag>/assets
           # 这个路径不存在，实测 404，所以 id 不是可选的美化。）
-          if ($release) {
-            $page = 1
-            while ($true) {
-              $batch = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/$($release.id)/assets?per_page=100&page=$page" -Headers $headers |
-                         ForEach-Object { $_.name })
-              $existing += $batch
-              if ($batch.Count -lt 100) { break }
-              $page += 1
-            }
-            Write-Host "release $tag already has $($existing.Count) asset(s)"
-          }
-          $pending = @($versions | Where-Object { $existing -notcontains (Get-AssetName $_) })
-          $skipped = @($versions | Where-Object { $existing -contains (Get-AssetName $_) })
-          if ($skipped.Count -gt 0) { Write-Host "already published, skipped: $($skipped -join ', ')" }
-          if ($pending.Count -gt 0) { Write-Host "to build: $($pending -join ', ')" }
-          else { Write-Host 'nothing to build: every asset of this release is published' }
+          if release:
+              page = 1
+              while True:
+                  batch = [item["name"] for item in api(
+                      "https://api.github.com/repos/%s/releases/%s/assets?per_page=100&page=%d"
+                      % (os.environ["GITHUB_REPOSITORY"], release["id"], page))]
+                  existing.extend(batch)
+                  if len(batch) < 100:
+                      break
+                  page += 1
+              print("release %s already has %d asset(s)" % (tag, len(existing)))
+
+          pending = [version for version in versions if asset_name(version) not in existing]
+          skipped = [version for version in versions if asset_name(version) in existing]
+          if skipped:
+              print("already published, skipped: %s" % ", ".join(skipped))
+          if pending:
+              print("to build: %s" % ", ".join(pending))
+          else:
+              print("nothing to build: every asset of this release is published")
 
           # 就地更新包与 dsh 版本无关，一个 DSH-AB 版本一份，所以「待构建的格子一个都没有」不代表
           # 没事可做：matrix 整片 skipped 时没有格子会顺手做它，Release 里缺的就是这一份。缺了就算
           # 有工作，由下面 update-pack job 补出来。
-          $updateAsset = "DSH-AB-$dshab-update.zip"
-          $updatePackNeeded = if ($existing -notcontains $updateAsset) { 'true' } else { 'false' }
+          update_asset = "DSH-AB-%s-update.zip" % dshab
+          update_pack_needed = "false" if update_asset in existing else "true"
 
-          # 更新包那个 job 用 -ProgramOnly 组装载荷（不解析任何 dsh 树），但随包那份 exe 里还是要编
-          # 一个 dsh 版本（versionText 已经没有「空 dsh 版本」这一路），所以这里给它一个标签：本 Release
-          # 已经带着的安装包里的最新那个，Release 还没有就取本轮要建的最新那个。它**不是**「要取到那份
-          # dsh」——npm 上取不到任何 dsh，那个 job 照样能造出更新包来。
-          $carried = @($existing | Where-Object { $_ -match "^DSH-AB-$([regex]::Escape($dshab))-(.+)-setup\.exe$" } |
-                       ForEach-Object { $Matches[1] })
-          $packDsh = @($carried + $pending + $versions | Sort-Object)[-1]
-          Write-Host "update pack exe label (a dsh version this release carries): $packDsh"
-          if ($updatePackNeeded -eq 'true') { Write-Host "the update pack $updateAsset is not in the release yet" }
+          # 更新包那个 job 用 --program-only 组装载荷（不解析任何 dsh 树），但随包那份 exe 里还是要编
+          # 一个 dsh 版本，所以这里给它一个标签：本 Release 已经带着的安装包里的最新那个，Release 还没有
+          # 就取本轮要建的最新那个。它**不是**「要取到那份 dsh」——npm 上取不到任何 dsh，那个 job 照样能
+          # 造出更新包来。
+          carried = []
+          for name in existing:
+              match = re.match("^DSH-AB-%s-(.+)-setup[.]exe$" % re.escape(dshab), name)
+              if match:
+                  carried.append(match.group(1))
+          pack_dsh = sorted(carried + pending + versions)[-1]
+          print("update pack exe label (a dsh version this release carries): %s" % pack_dsh)
+          if update_pack_needed == "true":
+              print("the update pack %s is not in the release yet" % update_asset)
 
-          # Built by hand: ConvertTo-Json turns a one-element array into a scalar, and the matrix
-          # needs an array. has_work is what skips the build job when there is nothing new.
-          $json = '[' + (($pending | ForEach-Object { '"' + $_ + '"' }) -join ',') + ']'
-          $hasWork = if ($pending.Count -gt 0) { 'true' } else { 'false' }
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "versions=$json"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "has_work=$hasWork"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "update_pack_needed=$updatePackNeeded"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "pack_dsh_version=$packDsh"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "dshab=$dshab"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          # 手写的 JSON 数组：matrix 要的就是数组，has_work 决定 build job 跳不跳。
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("versions=%s\n" % json.dumps(pending))
+              output.write("has_work=%s\n" % ("true" if pending else "false"))
+              output.write("update_pack_needed=%s\n" % update_pack_needed)
+              output.write("pack_dsh_version=%s\n" % pack_dsh)
+              output.write("dshab=%s\n" % dshab)
+              output.write("tag=%s\n" % tag)
 
   test:
-    # The program's own tests, on the same Go release the build job downloads into tools\go: the
-    # module lives in src\dsh-ab (the repository root is not a Go module). The icon tests are part
+    # The program's own tests, on the same Go release the build job downloads into tools/go: the
+    # module lives in src/dsh-ab (the repository root is not a Go module). The icon tests are part
     # of this run - they keep a broken .ico from shipping - and a failing test blocks the build
     # below, so nothing unverified is released.
-    name: go test (src\dsh-ab)
+    name: go test (src/dsh-ab)
     runs-on: windows-latest
     steps:
       - name: Check out the repository
@@ -192,14 +236,21 @@ jobs:
       - name: Provide the Go toolchain (actions/setup-go)
         uses: actions/setup-go@v5
         with:
-          # Keep in step with $GoVersion in build\provision-go.ps1, the toolchain every build job
-          # installs into tools\go (that file is the one place the version is written down now).
-          go-version: '1.24.0'
+          # The release GO_VERSION pins; the build job instead puts the same Go into tools/go.
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: src/dsh-ab/go.sum
 
+      - name: Provide the interpreter for the CI glue (actions/setup-python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: go test
+        shell: python
         working-directory: src/dsh-ab
-        run: go test ./... -count=1
+        run: |
+          import subprocess, sys
+          raise SystemExit(subprocess.call(["go", "test", "./...", "-count=1"]))
 
   build:
     name: dsh ${{ matrix.dsh_version }}
@@ -216,78 +267,190 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
-      - name: Provide the build toolchain (Go 1.24.0, Inno Setup 6.7.3)
-        shell: pwsh
+      - name: Provide the interpreter for the provisioning step (actions/setup-python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Provide the project toolchain (portable CPython ${{ env.PYTHON_VERSION }} -> tools/python, Go ${{ env.GO_VERSION }} -> tools/go)
+        shell: python
         run: |
-          $ErrorActionPreference = 'Stop'
+          import hashlib, os, shutil, subprocess, sys, urllib.request, zipfile
+          from pathlib import Path
 
-          # build\build.ps1 looks for the Go toolchain at <repo>\tools\go\bin\go.exe and for Inno
-          # Setup at %LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe - the same two places as on the
-          # development machine, and tools\ is git-ignored. Go 那一段两个 job 都要，抽成
-          # build\provision-go.ps1：版本 pin 只留在那一处，本地也能直接语法检查。
-          pwsh -NoProfile -File build\provision-go.ps1
+          root = Path.cwd()
+          temp = Path(os.environ.get("RUNNER_TEMP") or os.environ.get("TEMP") or ".")
 
-          # Inno Setup 只有这个 job 要，而且它落到 %LOCALAPPDATA%，所以留在这一行里。
-          # /CURRENTUSER keeps the per-user layout build.ps1 expects.
-          # Inno Setup moved its binaries to immutable GitHub releases in March 2026, so the old
-          # files.jrsoftware.org/is/6/innosetup-<version>.exe path 404s now. The tag is the version
-          # with dots as underscores (6.7.3 -> is-6_7_3), derived so the pin lives in one place.
-          $isVersion = '6.7.3'
-          $isExe = Join-Path $env:RUNNER_TEMP "innosetup-$isVersion.exe"
-          $isTag = 'is-' + ($isVersion -replace '\.', '_')
-          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$isTag/innosetup-$isVersion.exe" -OutFile $isExe -UseBasicParsing
-          Start-Process -FilePath $isExe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/SP-' -Wait
-          $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
-          Write-Host "ISCC: $iscc"
+          def fetch(url, dest, expected_sha256):
+              """下载、边下边算 sha256、与 env: 里那个 pin 比对，通过了调用方才敢解开它。"""
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              request = urllib.request.Request(url, headers={"User-Agent": "dsh-ab-ci"})
+              digest = hashlib.sha256()
+              with urllib.request.urlopen(request, timeout=1800) as response, open(dest, "wb") as handle:
+                  while True:
+                      chunk = response.read(1 << 20)
+                      if not chunk:
+                          break
+                      digest.update(chunk)
+                      handle.write(chunk)
+              actual = digest.hexdigest()
+              print("downloaded %s (%d bytes, sha256 %s)" % (url, dest.stat().st_size, actual))
+              if actual != expected_sha256:
+                  sys.exit("sha256 mismatch for %s: pinned %s, got %s" % (url, expected_sha256, actual))
+
+          def unzip(archive, target):
+              target.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(archive) as zipped:
+                  zipped.extractall(target)
+
+          # 工具链自己的解释器：文档里每一条命令都是 tools/python/python.exe，而 tools/ 是
+          # git-ignored，所以每个 job 现取一份同一个便携构建（官方 embeddable 包），装完断言版本。
+          python_version = os.environ["PYTHON_VERSION"]
+          python_zip = temp / ("python-%s-embed-amd64.zip" % python_version)
+          fetch("https://www.python.org/ftp/python/%s/python-%s-embed-amd64.zip"
+                % (python_version, python_version), python_zip, os.environ["PYTHON_SHA256"])
+          shutil.rmtree(root / "tools" / "python", ignore_errors=True)
+          unzip(python_zip, root / "tools" / "python")
+          check = subprocess.run([str(root / "tools" / "python" / "python.exe"), "--version"],
+                                 capture_output=True, text=True)
+          reported = (check.stdout + check.stderr).strip()
+          print(reported)
+          if check.returncode != 0 or python_version not in reported:
+              sys.exit("the portable interpreter is not %s (it said %s)" % (python_version, reported))
+
+          # Go 落到 <repo>/tools/go/bin/go.exe：build/py/dshab_build/paths.py 的 GO_EXE 只认这一个
+          # 路径，所以 build 与 update-pack 两个 job 都不能只靠 actions/setup-go 装到 PATH 上（test job
+          # 不跑工具链，它继续用 actions/setup-go）。下面 update-pack job 里那段与这一段除注释外逐字
+          # 相同：
+          # 本工作流之外没有可共用的脚本文件，版本与 sha256 这些 pin 在 env: 里各只有一处。
+          go_version = os.environ["GO_VERSION"]
+          go_zip = temp / ("go%s.windows-amd64.zip" % go_version)
+          fetch("https://go.dev/dl/go%s.windows-amd64.zip" % go_version, go_zip, os.environ["GO_SHA256"])
+          staged = temp / "go-extract"
+          shutil.rmtree(staged, ignore_errors=True)
+          unzip(go_zip, staged)
+          shutil.rmtree(root / "tools" / "go", ignore_errors=True)
+          (root / "tools").mkdir(parents=True, exist_ok=True)
+          shutil.move(str(staged / "go"), str(root / "tools" / "go"))
+          go_exe = root / "tools" / "go" / "bin" / "go.exe"
+          if not go_exe.is_file():
+              sys.exit("the provisioned Go has no %s" % go_exe)
+          check = subprocess.run([str(go_exe), "version"], capture_output=True, text=True)
+          print((check.stdout + check.stderr).strip())
+          if check.returncode != 0 or ("go" + go_version) not in check.stdout:
+              sys.exit("the provisioned Go is not go%s" % go_version)
+
+      - name: Provide Inno Setup ${{ env.INNO_SETUP_VERSION }} (ISCC where the toolchain looks for it)
+        shell: python
+        run: |
+          import hashlib, os, subprocess, sys, time, urllib.request
+          from pathlib import Path
+
+          temp = Path(os.environ.get("RUNNER_TEMP") or os.environ.get("TEMP") or ".")
+          # Inno Setup 只有 build job 要，而且它落到 %LOCALAPPDATA%（/CURRENTUSER 的那个位置），与 Go
+          # 的落点无关，所以留在这一步里。Inno Setup 2026 年 3 月起把二进制放在固定的 GitHub Release
+          # 上，旧的 files.jrsoftware.org/is/6/innosetup-<version>.exe 已经 404；tag 是版本号里的点换成
+          # 下划线（6.7.3 -> is-6_7_3），派生出来的，所以版本与 sha256 两个 pin 都只留在上面的 env: 里。
+          version = os.environ["INNO_SETUP_VERSION"]
+          tag = "is-" + version.replace(".", "_")
+          installer = temp / ("innosetup-%s.exe" % version)
+          request = urllib.request.Request(
+              "https://github.com/jrsoftware/issrc/releases/download/%s/innosetup-%s.exe" % (tag, version),
+              headers={"User-Agent": "dsh-ab-ci"})
+          digest = hashlib.sha256()
+          with urllib.request.urlopen(request, timeout=1800) as response, open(installer, "wb") as handle:
+              while True:
+                  chunk = response.read(1 << 20)
+                  if not chunk:
+                      break
+                  digest.update(chunk)
+                  handle.write(chunk)
+          actual = digest.hexdigest()
+          print("downloaded %s (%d bytes, sha256 %s)" % (installer, installer.stat().st_size, actual))
+          if actual != os.environ["INNO_SETUP_SHA256"]:
+              sys.exit("sha256 mismatch for the Inno Setup installer: pinned %s, got %s"
+                       % (os.environ["INNO_SETUP_SHA256"], actual))
+          # /CURRENTUSER 保持每用户布局，也就是 build/py/dshab_build/iscc.py 找编译器的那套位置。
+          result = subprocess.run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                                   "/CURRENTUSER", "/SP-"])
+          if result.returncode != 0:
+              sys.exit("the Inno Setup installer exited %d" % result.returncode)
+          iscc = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Inno Setup 6" / "ISCC.exe"
+          # 安装器自解压后由子进程落盘，可能晚一两秒，所以等 ISCC 出现而不是装完立刻断言。
+          deadline = time.time() + 300
+          while not iscc.is_file() and time.time() < deadline:
+              time.sleep(2)
+          if not iscc.is_file():
+              sys.exit("Inno Setup compiler not found: %s" % iscc)
+          print("ISCC: %s" % iscc)
 
       - name: Restore the payload cache (Node zip, MinGit zip, dsh trees, npm cache)
         id: payload-cache
         uses: actions/cache@v4
         with:
           path: cache
-          # mkpayload.ps1 也在键里：缓存装的是它解析出来的依赖树与锁，解析策略一改，旧缓存就必须作废。
-          key: payload-${{ runner.os }}-${{ matrix.dsh_version }}-${{ hashFiles('build/payload-sources.json', 'build/mkpayload.ps1') }}
+          # 缓存装的是 mkpayload 解析出来的依赖树与锁，解析策略一改，旧缓存就必须作废：hashFiles 里列出
+          # 的就是那份策略（载荷编排、依赖树解析、版本发布时刻规则）。
+          key: payload-${{ runner.os }}-${{ matrix.dsh_version }}-${{ hashFiles('build/payload-sources.json', 'build/py/dshab_build/mkpayload.py', 'build/py/dshab_build/dsh_tree.py', 'build/py/dshab_build/dsh_times.py') }}
 
       - name: Warm the payload cache from the network (cache miss only)
         if: steps.payload-cache.outputs.cache-hit != 'true'
-        shell: pwsh
+        shell: python
+        env:
+          DSH_VERSION: ${{ matrix.dsh_version }}
         run: |
-          # -Offline can only run against a populated cache and a fresh runner has none, so a
-          # cold cell populates it here once. Both artefacts this cell does not ship are skipped:
-          # the installer and the update pack - the latter is step 5/5, which looks at
-          # -SkipUpdatePack alone (build.ps1), so -SkipInstaller used to leave every cold cell
-          # building a second exe and a whole update pack that are then thrown away (only the
-          # installer is uploaded). The real, offline build is the next step.
-          pwsh -NoProfile -File build\build.ps1 -DshVersion '${{ matrix.dsh_version }}' -SkipInstaller -SkipUpdatePack
+          # --offline 只能对着灌好的缓存跑，冷 runner 上没有，所以先联网把载荷做出来。这一格不发的
+          # 两件产物都跳过：安装包与更新包——后者是第 5/5 步、只看 --skip-update-pack，所以
+          # --skip-installer 不会顺带跳过它。真正的离线构建是下一步。
+          import os, subprocess, sys
+          raise SystemExit(subprocess.call([
+              "tools/python/python.exe", "build/py/build.py",
+              "--dsh-version", os.environ["DSH_VERSION"],
+              "--skip-installer", "--skip-update-pack"]))
 
       - name: Build the installer offline
-        shell: pwsh
+        shell: python
+        env:
+          DSH_VERSION: ${{ matrix.dsh_version }}
         run: |
           # 格子只编安装包：就地更新包与 dsh 版本无关（dsh 本体在槽里），由下面 update-pack job 单独
-          # 做一份，这里用 -SkipUpdatePack 跳过。
-          pwsh -NoProfile -File build\build.ps1 -DshVersion '${{ matrix.dsh_version }}' -Offline -SkipUpdatePack
+          # 做一份，这里用 --skip-update-pack 跳过。
+          import os, subprocess, sys
+          raise SystemExit(subprocess.call([
+              "tools/python/python.exe", "build/py/build.py",
+              "--dsh-version", os.environ["DSH_VERSION"],
+              "--offline", "--skip-update-pack"]))
 
       - name: Verify silently (clear -> assert empty -> silent install -> silent uninstall)
-        shell: pwsh
+        shell: python
         run: |
-          # -Dir and -Iss default to the development machine's paths, so the runner overrides
-          # both. Everything else in verify-silent.ps1 is relative to the checkout.
-          pwsh -NoProfile -File build\verify-silent.ps1 -Dir '${{ github.workspace }}\.tmp-verify\install' -Iss '${{ github.workspace }}\installer\dsh-ab.iss'
+          # verify.py 的三个默认值（临时安装目录、按清单推出的安装包名、installer/dsh-ab.iss）都由它
+          # 自己的位置推出来，全是相对路径，所以在 runner 上不传任何参数。
+          import subprocess, sys
+          raise SystemExit(subprocess.call(["tools/python/python.exe", "build/py/verify.py"]))
 
       - name: Locate the built installer
         id: artefact
-        shell: pwsh
+        shell: python
         run: |
-          $ErrorActionPreference = 'Stop'
-          # The payload manifest is the one place the expected name and versions come from, the
-          # same record verify-silent.ps1 checks the built installer against.
-          $mf = Get-Content -LiteralPath 'payload\payload-manifest.json' -Raw | ConvertFrom-Json
-          $setup = Join-Path $env:GITHUB_WORKSPACE "dist\DSH-AB-$($mf.dshab_version)-$($mf.dsh_version)-setup.exe"
-          if (-not (Test-Path -LiteralPath $setup)) { throw "installer not found: $setup" }
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "setup=$setup"
-          Write-Host "installer: $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB)"
-          Write-Host "sha256: $((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash)"
+          import hashlib, json, os, sys
+          from pathlib import Path
+
+          # payload 清单是期望产物名与两个版本的唯一来源，也是 verify.py 核对安装结果的那份记录。
+          with open("payload/payload-manifest.json", encoding="utf-8-sig") as handle:
+              manifest = json.load(handle)
+          setup = (Path(os.environ["GITHUB_WORKSPACE"]) / "dist"
+                   / ("DSH-AB-%s-%s-setup.exe" % (manifest["dshab_version"], manifest["dsh_version"])))
+          if not setup.is_file():
+              sys.exit("installer not found: %s" % setup)
+          digest = hashlib.sha256()
+          with open(setup, "rb") as handle:
+              for chunk in iter(lambda: handle.read(1 << 20), b""):
+                  digest.update(chunk)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("setup=%s\n" % setup)
+          print("installer: %s (%.1f MB)" % (setup, setup.stat().st_size / (1024 * 1024)))
+          print("sha256: %s" % digest.hexdigest())
 
       - name: Upload the installer as a workflow artefact
         uses: actions/upload-artifact@v4
@@ -311,44 +474,118 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
-      - name: Provide the build toolchain (Go 1.24.0)
-        shell: pwsh
+      - name: Provide the interpreter for the provisioning step (actions/setup-python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Provide the project toolchain (portable CPython ${{ env.PYTHON_VERSION }} -> tools/python, Go ${{ env.GO_VERSION }} -> tools/go)
+        shell: python
         run: |
-          # 与 build job 同一份脚本（版本 pin 只留在那一处，本地也能语法检查）。这里不装 Inno Setup：
-          # 这个 job 不做安装器。
-          pwsh -NoProfile -File build\provision-go.ps1
+          # 与 build job 同一段：版本 pin 在 env: 里只有一处，本地也能对着 tools/python 跑同一套命令。
+          # 这里不装 Inno Setup——这个 job 不做安装器。
+          import hashlib, os, shutil, subprocess, sys, urllib.request, zipfile
+          from pathlib import Path
+
+          root = Path.cwd()
+          temp = Path(os.environ.get("RUNNER_TEMP") or os.environ.get("TEMP") or ".")
+
+          def fetch(url, dest, expected_sha256):
+              """下载、边下边算 sha256、与 env: 里那个 pin 比对，通过了调用方才敢解开它。"""
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              request = urllib.request.Request(url, headers={"User-Agent": "dsh-ab-ci"})
+              digest = hashlib.sha256()
+              with urllib.request.urlopen(request, timeout=1800) as response, open(dest, "wb") as handle:
+                  while True:
+                      chunk = response.read(1 << 20)
+                      if not chunk:
+                          break
+                      digest.update(chunk)
+                      handle.write(chunk)
+              actual = digest.hexdigest()
+              print("downloaded %s (%d bytes, sha256 %s)" % (url, dest.stat().st_size, actual))
+              if actual != expected_sha256:
+                  sys.exit("sha256 mismatch for %s: pinned %s, got %s" % (url, expected_sha256, actual))
+
+          def unzip(archive, target):
+              target.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(archive) as zipped:
+                  zipped.extractall(target)
+
+          python_version = os.environ["PYTHON_VERSION"]
+          python_zip = temp / ("python-%s-embed-amd64.zip" % python_version)
+          fetch("https://www.python.org/ftp/python/%s/python-%s-embed-amd64.zip"
+                % (python_version, python_version), python_zip, os.environ["PYTHON_SHA256"])
+          shutil.rmtree(root / "tools" / "python", ignore_errors=True)
+          unzip(python_zip, root / "tools" / "python")
+          check = subprocess.run([str(root / "tools" / "python" / "python.exe"), "--version"],
+                                 capture_output=True, text=True)
+          reported = (check.stdout + check.stderr).strip()
+          print(reported)
+          if check.returncode != 0 or python_version not in reported:
+              sys.exit("the portable interpreter is not %s (it said %s)" % (python_version, reported))
+
+          go_version = os.environ["GO_VERSION"]
+          go_zip = temp / ("go%s.windows-amd64.zip" % go_version)
+          fetch("https://go.dev/dl/go%s.windows-amd64.zip" % go_version, go_zip, os.environ["GO_SHA256"])
+          staged = temp / "go-extract"
+          shutil.rmtree(staged, ignore_errors=True)
+          unzip(go_zip, staged)
+          shutil.rmtree(root / "tools" / "go", ignore_errors=True)
+          (root / "tools").mkdir(parents=True, exist_ok=True)
+          shutil.move(str(staged / "go"), str(root / "tools" / "go"))
+          go_exe = root / "tools" / "go" / "bin" / "go.exe"
+          if not go_exe.is_file():
+              sys.exit("the provisioned Go has no %s" % go_exe)
+          check = subprocess.run([str(go_exe), "version"], capture_output=True, text=True)
+          print((check.stdout + check.stderr).strip())
+          if check.returncode != 0 or ("go" + go_version) not in check.stdout:
+              sys.exit("the provisioned Go is not go%s" % go_version)
 
       - name: Restore the payload cache (MinGit zip)
         id: payload-cache
         uses: actions/cache@v4
         with:
           path: cache
-          # 键里没有 dsh 版本，也没有 node：-ProgramOnly 的载荷只有便携 Git 要从网上取，与上游的
+          # 键里没有 dsh 版本，也没有 node：--program-only 的载荷只有便携 Git 要从网上取，与上游的
           # dsh 版本无关，所以这个 job 不会再因为某一个 dsh 版本的缓存键过期而去联网解析整棵 dsh 树。
-          key: payload-programs-${{ runner.os }}-${{ hashFiles('build/payload-sources.json', 'build/mkpayload.ps1') }}
+          key: payload-programs-${{ runner.os }}-${{ hashFiles('build/payload-sources.json', 'build/py/dshab_build/mkpayload.py', 'build/py/dshab_build/dsh_tree.py', 'build/py/dshab_build/dsh_times.py') }}
 
       - name: Warm the payload cache from the network (cache miss only)
         if: steps.payload-cache.outputs.cache-hit != 'true'
-        shell: pwsh
+        shell: python
+        env:
+          PACK_DSH_VERSION: ${{ needs.discover.outputs.pack_dsh_version }}
         run: |
-          # -Offline 只能对着已经灌好的缓存跑，冷 runner 上没有，所以先联网把 payload 做出来。
+          # --offline 只能对着已经灌好的缓存跑，冷 runner 上没有，所以先联网把 payload 做出来。
           # 更新包在这一步不做：它是下一步的产物，那一步才是这个 job 存在的理由。
-          pwsh -NoProfile -File build\build.ps1 -DshVersion '${{ needs.discover.outputs.pack_dsh_version }}' -ProgramOnly -SkipInstaller -SkipUpdatePack
+          import os, subprocess, sys
+          raise SystemExit(subprocess.call([
+              "tools/python/python.exe", "build/py/build.py",
+              "--dsh-version", os.environ["PACK_DSH_VERSION"],
+              "--program-only", "--skip-installer", "--skip-update-pack"]))
 
       - name: Build the in-place update pack offline
-        shell: pwsh
+        shell: python
+        env:
+          PACK_DSH_VERSION: ${{ needs.discover.outputs.pack_dsh_version }}
         run: |
-          # 载荷只装程序文件（-ProgramOnly）：包里本来一个 dsh 文件都没有（build\mkupdate.ps1 只取
-          # exe、README/LICENSES/.gitignore 与 runtime\，docs\ 里的台账不带），所以这一步不取 node、不解析 dsh 树、
-          # 也不碰 npm——上游把某个旧 dsh 从 registry 撤了，照样挡不住新版本造出更新包来。
+          # 载荷只装程序文件（--program-only）：包里本来一个 dsh 文件都没有（build/py/dshab_build/
+          # mkupdate.py 只取 exe、README/LICENSES/.gitignore 与 runtime/，docs/ 里的台账不带），所以这一步
+          # 不取 node、不解析 dsh 树、也不碰 npm——上游把某个旧 dsh 从 registry 撤了，照样挡不住新版
+          # 本造出更新包来。
           #
-          # -DshVersion 传的是 discover 给的那个标签（本 Release 带着的某个 dsh 版本）：随包那份 exe
+          # --dsh-version 传的是 discover 给的那个标签（本 Release 带着的某个 dsh 版本）：随包那份 exe
           # 里编着它，只为让 --version 与托盘不至于报出一个空的 dsh 版本；产物
-          # dist\DSH-AB-<DSH-AB 版本>-update.zip 与它无关。
+          # dist/DSH-AB-<DSH-AB 版本>-update.zip 与它无关。
           #
-          # -SkipInstaller 只跳过 4/5：5/5 更新包只看 -SkipUpdatePack，所以这个 job 既不装 Inno Setup、
-          # 也不编没人要的安装包，dist 里只有这一份包。
-          pwsh -NoProfile -File build\build.ps1 -DshVersion '${{ needs.discover.outputs.pack_dsh_version }}' -ProgramOnly -Offline -SkipInstaller
+          # --skip-installer 只跳过 4/5：5/5 更新包只看 --skip-update-pack，所以这个 job 既不装 Inno
+          # Setup、也不编没人要的安装包，dist 里只有这一份包。
+          import os, subprocess, sys
+          raise SystemExit(subprocess.call([
+              "tools/python/python.exe", "build/py/build.py",
+              "--dsh-version", os.environ["PACK_DSH_VERSION"],
+              "--program-only", "--offline", "--skip-installer"]))
 
       - name: Upload the in-place update pack as a workflow artefact
         uses: actions/upload-artifact@v4
@@ -387,131 +624,127 @@ jobs:
           name: DSH-AB-update
           path: dist
 
+      - name: Provide the interpreter for the CI glue (actions/setup-python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Ensure the release exists, then upload the installers
-        shell: pwsh
+        shell: python
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.discover.outputs.tag }}
+          DSHAB: ${{ needs.discover.outputs.dshab }}
+          UPDATE_PACK_NEEDED: ${{ needs.discover.outputs.update_pack_needed }}
+          UPDATE_PACK_RESULT: ${{ needs.update-pack.result }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          # gh release view fails on purpose while the release does not exist yet.
-          $PSNativeCommandUseErrorActionPreference = $false
-          $repo  = '${{ github.repository }}'
-          $tag   = '${{ needs.discover.outputs.tag }}'
-          $dshab = '${{ needs.discover.outputs.dshab }}'
-          $base = "https://github.com/$repo/releases/download/$tag"
+          import os, re, subprocess, sys, tempfile
+          from pathlib import Path
+
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+          dshab = os.environ["DSHAB"]
+          base = "https://github.com/%s/releases/download/%s" % (repo, tag)
+
+          def gh(args, check=True):
+              result = subprocess.run(["gh"] + args, capture_output=True, text=True)
+              if check and result.returncode != 0:
+                  sys.exit("gh %s failed (%d): %s" % (" ".join(args), result.returncode, result.stderr.strip()))
+              return result
 
           # 没有安装包、只有更新包不算「什么都没造出来」：一个待构建的格子都没有的那一轮补发的正是
           # 这份更新包，早退会把这条路堵死。两样都没有（每个格子都失败）才早退：空 Release 比没有
           # Release 更糟。已存在的 Release 这里不碰（说明表最后还是按真实 asset 重写）。
-          $setups  = @(Get-ChildItem -LiteralPath 'dist' -File -Filter 'DSH-AB-*-setup.exe')
-          $updates = @(Get-ChildItem -LiteralPath 'dist' -File -Filter 'DSH-AB-*-update.zip')
-          if ($setups.Count -eq 0 -and $updates.Count -eq 0) {
-            Write-Host 'neither an installer nor an update pack was built in this run, nothing to publish'
-            exit 0
-          }
-          if ($setups.Count -eq 0) { Write-Host 'no installer was built in this run: publishing the update pack only' }
+          setups = sorted(Path("dist").glob("DSH-AB-*-setup.exe"))
+          updates = sorted(Path("dist").glob("DSH-AB-*-update.zip"))
+          if not setups and not updates:
+              print("neither an installer nor an update pack was built in this run, nothing to publish")
+              raise SystemExit(0)
+          if not setups:
+              print("no installer was built in this run: publishing the update pack only")
           # 更新包不在 dist 里最常见的原因是 update-pack job 被正常 skip（Release 里已经有那一份，
           # discover 因此说 update_pack_needed=false）——那不是失败，别把最常见的增量路径报成红。
           # 只有「该做却没做出来」才提醒：discover 说缺这一份，而那个 job 又没有成功退出。
-          $updatePackNeeded = '${{ needs.discover.outputs.update_pack_needed }}'
-          $updatePackResult = '${{ needs.update-pack.result }}'
-          if ($updates.Count -eq 0 -and $updatePackNeeded -eq 'true' -and $updatePackResult -ne 'success') {
-            Write-Warning "dist 里没有就地更新包，而 discover 说 Release 缺这一份（update-pack job 结果是 $updatePackResult）：这次只发安装包，Release 里已有的那份和说明表里那一行都不动"
-          }
+          if (not updates and os.environ["UPDATE_PACK_NEEDED"] == "true"
+                  and os.environ["UPDATE_PACK_RESULT"] != "success"):
+              print("::warning::dist 里没有就地更新包，而 discover 说 Release 缺这一份（update-pack job 结果是 %s）：这次只发安装包，Release 里已有的那份和说明表里那一行都不动" % os.environ["UPDATE_PACK_RESULT"])
 
           # 版本排序只按数字：字符串排序会把 0.1.10 排到 0.1.9 前面，也会把 0.1.0-rc.7 排到
           # 0.1.7-alpha.2 前面。而 Release 页面里的 asset 列表恰恰就是按文件名排的，改不了——所以
           # 说明最上方放一张表，打开页面第一眼就是最新的那一版。
-          function Get-VersionKey([string]$Version) {
-            $core, $pre = $Version -split '-', 2
-            $n = @(($core -split '\.') | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
-            while ($n.Count -lt 3) { $n += 0 }
-            $preKey = ''
-            if ($pre) {
+          def version_key(version):
+              core, _, pre = version.partition("-")
+              numbers = [int(piece) for piece in core.split(".") if piece]
+              while len(numbers) < 3:
+                  numbers.append(0)
               # 预发布里的数字补齐到六位再比，rc.10 才不会排到 rc.9 前面。
-              $preKey = (($pre -split '(\d+)') | ForEach-Object {
-                if ($_ -match '^\d+$') { $_.PadLeft(6, '0') } else { $_ }
-              }) -join ''
-            }
-            [pscustomobject]@{
-              Major = $n[0]; Minor = $n[1]; Patch = $n[2]
-              # 全表按「新 → 旧」排：正式版（1）排在它自己的预发布（0）前面。
-              Rank = if ($pre) { 0 } else { 1 }
-              Pre = $preKey
-            }
-          }
+              pre_key = "".join(piece.rjust(6, "0") if piece.isdigit() else piece
+                                for piece in re.split("([0-9]+)", pre))
+              # 全表按「新 -> 旧」排：正式版（1）排在它自己的预发布（0）前面。
+              return (numbers[0], numbers[1], numbers[2], 0 if pre else 1, pre_key)
+
           # 说明表按 Release 里真实存在的 asset 生成，而不是按本轮 dist 里有什么：增量运行时本轮
           # 可能只造出一两个安装包，早就发过的那些必须继续留在表里——页面上那张下载表就是它，
           # 按本轮产物重写会把表缩成本轮那几行。
-          function New-ReleaseNotes([string[]]$AssetNames) {
-            $rows = @(foreach ($name in $AssetNames) {
-              # 这里能直接减掉 DSH-AB 自己的版本号：它来自本次 discover，不会认错。
-              if ($name -match ("^DSH-AB-" + [regex]::Escape($dshab) + "-(.+)-setup\.exe$")) {
-                $dsh = $Matches[1]
-                [pscustomobject]@{ Key = (Get-VersionKey $dsh); Dsh = $dsh; Name = $name }
-              }
-            })
-            $sortKeys = @(
-              @{ Expression = { $_.Key.Major }; Descending = $true },
-              @{ Expression = { $_.Key.Minor }; Descending = $true },
-              @{ Expression = { $_.Key.Patch }; Descending = $true },
-              @{ Expression = { $_.Key.Rank };  Descending = $true },
-              @{ Expression = { $_.Key.Pre };   Descending = $true }
-            )
-            $rows = @($rows | Sort-Object -Property $sortKeys)
-            $updateName = "DSH-AB-$dshab-update.zip"
+          def release_notes(asset_names):
+              rows = []
+              for name in asset_names:
+                  # 这里能直接减掉 DSH-AB 自己的版本号：它来自本次 discover，不会认错。
+                  match = re.match("^DSH-AB-%s-(.+)-setup[.]exe$" % re.escape(dshab), name)
+                  if match:
+                      rows.append((version_key(match.group(1)), match.group(1), name))
+              rows.sort(key=lambda row: row[0], reverse=True)
+              update_name = "DSH-AB-%s-update.zip" % dshab
+              notes = ["# DSH-AB %s" % dshab, "", "## 下载（最新在最上面）", "",
+                       "| dsh 版本 | 安装包 |", "| --- | --- |"]
+              for _key, dsh, name in rows:
+                  notes.append("| %s | [%s](%s/%s) |" % (dsh, name, base, name))
+              if update_name in asset_names:
+                  notes.append("| 就地更新包（与 dsh 版本无关） | [%s](%s/%s) |" % (update_name, base, update_name))
+              notes += [
+                  "",
+                  "> 下面的 Assets 文件列表是 GitHub 按**文件名**排序的，和版本新旧无关：要看最新版就看上面这张表。",
+                  "",
+                  "DSH-AB %s：本 Release 收录上游各 dsh 版本的安装包。" % dshab,
+                  "asset 名形如 DSH-AB-<DSH-AB 版本>-<dsh 版本>-setup.exe，两段版本分别是 DSH-AB 与 dsh 的版本。",
+                  "DSH-AB-%s-update.zip 是就地更新包：一个 DSH-AB 版本一份，与 dsh 版本无关，覆盖到安装根的程序文件上即可（槽位、dsh-ab.toml 与 docs\\ 里累计的台账都不受影响）。" % dshab,
+                  "上游出新版本（alpha / rc / 正式版都算）时由本工作流自动构建并加进来，已经在这里的版本不重复构建。",
+                  "Windows x64，安装包未做代码签名。",
+              ]
+              print("notes table: %d installer row(s) + %d update pack row(s), out of %d asset name(s)"
+                    % (len(rows), 1 if update_name in asset_names else 0, len(asset_names)))
+              return notes
 
-            # One element per line: Set-Content writes the array as the note text.
-            $notes = @()
-            $notes += "# DSH-AB $dshab"
-            $notes += ''
-            $notes += '## 下载（最新在最上面）'
-            $notes += ''
-            $notes += '| dsh 版本 | 安装包 |'
-            $notes += '| --- | --- |'
-            foreach ($row in $rows) {
-              $notes += "| $($row.Dsh) | [$($row.Name)]($base/$($row.Name)) |"
-            }
-            if ($AssetNames -contains $updateName) {
-              $notes += "| 就地更新包（与 dsh 版本无关） | [$updateName]($base/$updateName) |"
-            }
-            $notes += ''
-            $notes += '> 下面的 Assets 文件列表是 GitHub 按**文件名**排序的，和版本新旧无关：要看最新版就看上面这张表。'
-            $notes += ''
-            $notes += "DSH-AB $dshab：本 Release 收录上游各 dsh 版本的安装包。"
-            $notes += 'asset 名形如 DSH-AB-<DSH-AB 版本>-<dsh 版本>-setup.exe，两段版本分别是 DSH-AB 与 dsh 的版本。'
-            $notes += 'DSH-AB-<DSH-AB 版本>-update.zip 是就地更新包：一个 DSH-AB 版本一份，与 dsh 版本无关，覆盖到安装根的程序文件上即可（槽位、dsh-ab.toml 与 docs\ 里累计的台账都不受影响）。'
-            $notes += '上游出新版本（alpha / rc / 正式版都算）时由本工作流自动构建并加进来，已经在这里的版本不重复构建。'
-            $notes += 'Windows x64，安装包未做代码签名。'
-            Write-Host "notes table: $($rows.Count) installer row(s) + $(if ($AssetNames -contains $updateName) { 1 } else { 0 }) update pack row(s), out of $($AssetNames.Count) asset name(s)"
-            return $notes
-          }
+          notes_file = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "release-notes.md"
 
-          $null = gh release view $tag --repo $repo 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "release $tag exists, uploading into it"
-          } else {
-            # 新建的 Release 先按「即将上传的这些文件」写一份说明，中途失败也不至于留下空正文；
-            # 上传完成后下面还会按真实清单再写一次。
-            $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-            Set-Content -LiteralPath $notesFile -Value (New-ReleaseNotes (@($setups.Name) + @($updates.Name))) -Encoding utf8
-            gh release create $tag --repo $repo --title "DSH-AB $dshab" --latest --notes-file $notesFile
-            if ($LASTEXITCODE -ne 0) { throw "gh release create failed: $tag" }
-          }
+          def write_notes(lines):
+              with open(notes_file, "w", encoding="utf-8") as handle:
+                  handle.write("\n".join(lines) + "\n")
 
-          foreach ($file in (@($setups) + @($updates))) {
-            Write-Host "uploading $($file.Name)"
-            gh release upload $tag $file.FullName --repo $repo --clobber
-            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed: $($file.Name)" }
-          }
+          # gh release view 在 Release 还不存在时按预期失败。
+          if gh(["release", "view", tag, "--repo", repo], check=False).returncode == 0:
+              print("release %s exists, uploading into it" % tag)
+          else:
+              # 新建的 Release 先按「即将上传的这些文件」写一份说明，中途失败也不至于留下空正文；
+              # 上传完成后下面还会按真实清单再写一次。
+              write_notes(release_notes([path.name for path in setups] + [path.name for path in updates]))
+              gh(["release", "create", tag, "--repo", repo, "--title", "DSH-AB %s" % dshab,
+                  "--latest", "--notes-file", str(notes_file)])
+
+          for path in setups + updates:
+              print("uploading %s" % path.name)
+              gh(["release", "upload", tag, str(path.resolve()), "--repo", repo, "--clobber"])
 
           # 上传之后按这个 Release 的真实 asset 清单重写说明：本轮没造出来的安装包与更新包，
           # 只要它们的 asset 还在这里，就继续留在表里。
-          $releaseId = (gh api "repos/$repo/releases/tags/$tag" --jq '.id').Trim()
-          $assetNames = @(gh api "repos/$repo/releases/$releaseId/assets?per_page=100" --paginate --jq '.[].name')
-          if ($assetNames.Count -eq 0) { throw "release $tag has no asset even after the upload" }
-          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-          Set-Content -LiteralPath $notesFile -Value (New-ReleaseNotes $assetNames) -Encoding utf8
-          gh release edit $tag --repo $repo --latest --notes-file $notesFile
-          if ($LASTEXITCODE -ne 0) { throw "gh release edit failed: $tag" }
-          Write-Host "$($setups.Count) installer(s) and $($updates.Count) update pack(s) uploaded; release $tag now holds $($assetNames.Count) asset(s)"
+          release_id = gh(["api", "repos/%s/releases/tags/%s" % (repo, tag), "--jq", ".id"]).stdout.strip()
+          asset_names = [line.strip() for line in gh(
+              ["api", "repos/%s/releases/%s/assets?per_page=100" % (repo, release_id),
+               "--paginate", "--jq", ".[].name"]).stdout.splitlines() if line.strip()]
+          if not asset_names:
+              sys.exit("release %s has no asset even after the upload" % tag)
+          write_notes(release_notes(asset_names))
+          gh(["release", "edit", tag, "--repo", repo, "--latest", "--notes-file", str(notes_file)])
+          print("%d installer(s) and %d update pack(s) uploaded; release %s now holds %d asset(s)"
+                % (len(setups), len(updates), tag, len(asset_names)))

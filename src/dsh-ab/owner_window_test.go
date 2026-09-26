@@ -12,6 +12,12 @@ var procGetWindowLongW = windows.NewLazySystemDLL("user32.dll").NewProc("GetWind
 // with a NULL owner is a root-level window: Windows gives it a taskbar button of
 // its own and it inherits no icon, which is the stray icon the user reported. The
 // owner itself must stay invisible and must not become a taskbar button either.
+//
+// Run this with the documented -count=1. popupOwner pins its calling goroutine to its OS
+// thread (see owner_window.go) so the window and its icon are created on one thread; Go runs
+// each -count iteration in a fresh goroutine, and Windows destroys a thread's windows when the
+// goroutine pinned to it ends - so a second in-process iteration inspects a dead handle and
+// fails. Production calls it once, from main, which outlives every popup.
 func TestPopupOwnerIsAHiddenToolWindowWithTheAppIcon(t *testing.T) {
 	hwnd := popupOwner()
 	if hwnd == 0 {

@@ -97,6 +97,61 @@ func (s *State) ActiveSlot() string {
 	return s.active
 }
 
+// Reload re-reads both state files and adopts what is on disk as authoritative,
+// reporting whether anything really changed.
+//
+// It exists because a registration written by the maintenance agent was invisible:
+// State was read once at startup, so the menu kept saying 槽位切换, the status popup
+// kept saying 未登记, and 重启 read a nil in-memory Pending and silently did not switch
+// at all. Reload is called from the tray's 2 second refresh loop.
+//
+// Reload never writes the files back: writing them back is exactly what would erase a
+// registration somebody else just wrote. A file that is missing or unreadable keeps the
+// last good in-memory value and is reported through Warnings instead of clearing state;
+// a missing pending.json is the normal "nothing is registered", so that one clears.
+func (s *State) Reload() (changed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var af activeFile
+	switch ok, err := readJSON(filepath.Join(s.dir, "active.json"), &af); {
+	case err != nil:
+		s.warnLocked(fmt.Sprintf("active.json 无法解析（%v），继续按内存里的 %s 处理", err, s.active))
+	case !ok:
+		s.warnLocked(fmt.Sprintf("active.json 不见了，继续按内存里的 %s 处理", s.active))
+	case !validSlot(af.Slot):
+		s.warnLocked(fmt.Sprintf("active.json 内容无效（%q），继续按内存里的 %s 处理", af.Slot, s.active))
+	case af.Slot != s.active:
+		s.active, changed = af.Slot, true
+	}
+
+	var pending Registration
+	switch ok, err := readJSON(filepath.Join(s.dir, "pending.json"), &pending); {
+	case err != nil:
+		s.warnLocked(fmt.Sprintf("pending.json 无法解析（%v），保留内存里的登记", err))
+	case !ok:
+		if s.Pending != nil {
+			s.Pending, changed = nil, true
+		}
+	case !validSlot(pending.TargetSlot):
+		s.warnLocked(fmt.Sprintf("pending.json 目标槽无效（%q），保留内存里的登记", pending.TargetSlot))
+	case s.Pending == nil || s.Pending.TargetSlot != pending.TargetSlot:
+		p := pending
+		s.Pending, changed = &p, true
+	}
+	return changed
+}
+
+// warnLocked appends one warning, but never the same one twice in a row: Reload runs
+// every two seconds, and a file that stays broken must not grow Warnings forever or
+// fill the log with one identical line per tick.
+func (s *State) warnLocked(msg string) {
+	if n := len(s.Warnings); n > 0 && s.Warnings[n-1] == msg {
+		return
+	}
+	s.Warnings = append(s.Warnings, msg)
+}
+
 // RollbackPhase is what menu item 4 shows: not registered / waiting to take
 // effect. Those two are the whole state machine (user 2026-09-19).
 func (s *State) RollbackPhase() string {
