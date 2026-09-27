@@ -186,6 +186,11 @@ type Runner struct {
 	tail     *lineTail
 	exitNote string
 	launched bool
+
+	// job owns this Runner's child in a Windows job object, so a tray that is killed
+	// instead of asked to stop cannot leave the child behind (see job.go). Its zero
+	// value is usable; it costs nothing until the first Start.
+	job jobObject
 }
 
 func NewRunner(root string, cfg *Config, lg *Logger) *Runner {
@@ -267,6 +272,13 @@ func (r *Runner) Start(slot string, port int) error {
 		return err
 	}
 	pw.Close() // the child holds the only remaining write handle
+
+	// 把子进程放进托盘自己的作业对象：托盘被强杀（Stop-Process -Force / 任务管理器）时，
+	// 内核会连同整个 job 一起带走 dsh，不会有孤儿进程占着生产端口。尽力而为——建不出 job
+	// 或分配失败只写一条警告，启动照常（见 job.go）。
+	if err := r.job.assign(cmd.Process.Pid); err != nil && r.lg != nil {
+		r.lg.Warnf("dsh 子进程未能归入作业对象，托盘被强杀时它可能不会被一起结束：%v", err)
+	}
 
 	// Publish this child before anything can observe it: the pump and the wait
 	// goroutine both report into the fields set here. Start already holds r.mu for
@@ -411,7 +423,16 @@ func (r *Runner) aliveLocked() bool {
 }
 
 // Stop ends the child process and, when kill_tree is set, its whole tree.
-// It tries a graceful stop first and only escalates after stop_grace_s.
+//
+// The two routes are not equivalent, and the log says which one was taken. With kill_tree the tree
+// is ended in one call through the job object this Runner already owns (job.go):
+// TerminateJobObject ends every process in the job, and it is the only call that can end this tree
+// at all - the child is a console program started with CREATE_NO_WINDOW, so a non-forced
+// termination request has nothing to arrive at and provably fails (taskkill /PID N /T without /F
+// answers "This process can only be terminated forcefully (with /F option)", exit 128). Nothing is
+// waited for on that route, so stop_grace_s does not apply to it. kill_tree = false is the
+// single-process route and is the only one that waits the grace period out before killing, which
+// is why there is no invented graceful signal here and why the INFO line says which route ran.
 func (r *Runner) Stop() {
 	r.mu.Lock()
 	cmd, exited := r.cmd, r.exited
@@ -432,24 +453,30 @@ func (r *Runner) Stop() {
 		return
 	}
 	pid := cmd.Process.Pid
-	grace := time.Duration(r.cfg.Launch.StopGraceS) * time.Second
 
-	gracefulOK := true
-	if r.cfg.Launch.KillTree {
-		gracefulOK = r.taskkill(pid, false) == nil
-	}
-	if !gracefulOK {
-		if r.lg != nil {
-			r.lg.Debugf("优雅停止不可用，直接结束 PID %d", pid)
+	// forced is the route this Stop really took, and reason is what its INFO line adds: the two
+	// routes differ in whether stop_grace_s was waited out.
+	forced, reason := false, ""
+	if r.cfg.Launch.KillTree && r.job.owns() {
+		forced = true
+		reason = "整个进程树由作业对象结束，未等待 stop_grace_s"
+		// 尽力而为，和 job.go 的其余部分一样：失败只写一条 WARN，后面那段等待照样会报出没能结束的进程。
+		if err := r.job.terminate(); err != nil && r.lg != nil {
+			r.lg.Warnf("未能通过作业对象结束 dsh 进程树：%v", err)
 		}
-		r.forceKill(cmd, pid)
 	} else {
-		deadline := time.Now().Add(grace)
+		// 单进程路：先等 stop_grace_s，仍然活着才结束它。作业对象没接住这个子进程时也走这里——
+		// 空的作业对象什么都结束不了，把它当成「已经杀了整棵树」会把 dsh 留成孤儿占着生产端口。
+		deadline := time.Now().Add(time.Duration(r.cfg.Launch.StopGraceS) * time.Second)
 		for alive() && time.Now().Before(deadline) {
 			time.Sleep(200 * time.Millisecond)
 		}
 		if alive() {
-			r.forceKill(cmd, pid)
+			if err := cmd.Process.Kill(); err != nil && r.lg != nil {
+				r.lg.Warnf("结束进程失败：%v", err)
+			}
+			forced = true
+			reason = "等待 stop_grace_s 后仍在运行，只结束了子进程"
 		}
 	}
 	for i := 0; i < 50 && alive(); i++ {
@@ -458,37 +485,23 @@ func (r *Runner) Stop() {
 	if alive() && r.lg != nil {
 		r.lg.Errorf("PID %d 未能结束", pid)
 	}
+	// 两条路都写 INFO，但写的是各自的事实：以前两路都写「已停止 dsh（PID N）」，
+	// 于是日志看不出到底等了 stop_grace_s 没有（2026-09-25 实测）。forced 只由真正跑过的那条路设置，
+	// 括号里说明的就是那条路，以及它有没有等 stop_grace_s。
 	if r.lg != nil {
-		r.lg.Info("已停止 dsh（PID %d）", pid)
+		if forced {
+			r.lg.Info("已强制结束 dsh（PID %d，%s）", pid, reason)
+		} else {
+			r.lg.Info("已停止 dsh（PID %d）", pid)
+		}
 	}
 	r.clear()
 }
 
+// clear forgets the running child, so Slot() answers "" once the child is gone.
 func (r *Runner) clear() {
 	r.mu.Lock()
 	r.cmd, r.exited, r.slot = nil, nil, ""
 	r.authURL, r.urlReady = "", nil
 	r.mu.Unlock()
-}
-
-func (r *Runner) forceKill(cmd *exec.Cmd, pid int) {
-	if r.cfg.Launch.KillTree {
-		if err := r.taskkill(pid, true); err != nil && r.lg != nil {
-			r.lg.Warnf("taskkill /F 失败：%v", err)
-		}
-		return
-	}
-	if err := cmd.Process.Kill(); err != nil && r.lg != nil {
-		r.lg.Warnf("结束进程失败：%v", err)
-	}
-}
-
-func (r *Runner) taskkill(pid int, force bool) error {
-	args := []string{"/PID", strconv.Itoa(pid), "/T"}
-	if force {
-		args = append(args, "/F")
-	}
-	kill := exec.Command("taskkill", args...)
-	kill.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
-	return kill.Run()
 }

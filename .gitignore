@@ -30,8 +30,19 @@ src/dsh-ab/dsh-ab.exe
 # 靠目录结构保证，不靠一份会漂移的文件清单：公开的 docs\ 只留顶层文件（MAINTAINING.md），
 # 本地开发笔记都在 docs\ 的子目录里。
 docs/*/
+# 但契约文档是规范，必须进版本库（审计 M3）
+!docs/contract/
 
 # 记忆库与其它本地状态（绝不能上传）
 .dsh-meow/
 # 所有临时目录一律排除（.tmp-* 是构建/测试脚手架）
 .tmp-*/
+# Python 工具链的字节码缓存（构建/验收工具会同目录生成）
+__pycache__/
+*.pyc
+# 构建期生成的安装器片段（build.py 写出，.iss 用 #if FileExists 保护式包含）
+installer/dsh-ab.generated.iss
+# 开发脚本放在 sandbox/ 之外一律不跟踪
+.*.py
+# 开发时的 AI 工作说明，本地保留
+AGENTS.md

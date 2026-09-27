@@ -19,9 +19,11 @@ func validLogLevel(l string) bool {
 	return l == LevelOff || l == LevelAuto || l == LevelFull
 }
 
-// Logger is the single place that writes dsh-ab.log. off keeps errors only, auto
-// adds warnings and debug lines, full records everything - info lines and the
-// child's output included.
+// Logger is the single place that writes dsh-ab.log. The three gears are the three
+// filters, and each one has to be worth reading: off keeps errors only, auto keeps
+// error + warn + info (the startup banner and the port-ready line included, so a
+// clean start still leaves a log), full keeps everything - debug lines and the child's
+// own output too.
 type Logger struct {
 	mu       sync.Mutex
 	dir      string
@@ -104,14 +106,15 @@ func (l *Logger) WriteError() error {
 	return l.writeErr
 }
 
-// The first argument of write is the level a line starts at: off keeps errors,
-// auto adds warnings and debug, full also keeps info lines and child output.
-func (l *Logger) Info(format string, args ...any)  { l.write(LevelFull, "INFO ", format, args...) }
+// The first argument of write is the level a line starts at, i.e. the least verbose
+// gear that still keeps it: errors land at every level, warn and info at auto and
+// full, debug and the child's output at full only.
+func (l *Logger) Info(format string, args ...any)  { l.write(LevelAuto, "INFO ", format, args...) }
 func (l *Logger) Warnf(format string, args ...any) { l.write(LevelAuto, "WARN ", format, args...) }
 func (l *Logger) Errorf(format string, args ...any) {
 	l.write(LevelOff, "ERROR", format, args...)
 }
-func (l *Logger) Debugf(format string, args ...any) { l.write(LevelAuto, "DEBUG", format, args...) }
+func (l *Logger) Debugf(format string, args ...any) { l.write(LevelFull, "DEBUG", format, args...) }
 
 // Child records one line of the dsh child's output, tagged with the slot that
 // child was started from. The log accumulates across restarts, so after a slot

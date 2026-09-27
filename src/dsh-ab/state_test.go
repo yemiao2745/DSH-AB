@@ -33,6 +33,72 @@ func TestFreshInstallHasNoRegistration(t *testing.T) {
 	}
 }
 
+// TestReloadAdoptsARegistrationWrittenBySomebodyElse: the maintenance agent writes
+// state\pending.json directly, and the tray has to notice it. Without Reload the menu
+// kept saying 「槽位切换」and 重启 read a Pending from startup time and silently did not
+// switch at all (2026-09-24，真机报告).
+func TestReloadAdoptsARegistrationWrittenBySomebodyElse(t *testing.T) {
+	st, dir := newTestState(t)
+
+	// 外部写入：绕开 State.Register，直接落盘，就像维护代理做的那样。
+	mustWrite(t, filepath.Join(dir, "pending.json"), `{"target_slot":"slot-b"}`)
+
+	if !st.Reload() {
+		t.Fatal("外部写进 pending.json 的登记没有被察觉")
+	}
+	if st.RollbackPhase() != phasePending {
+		t.Fatalf("Reload 后 phase = %q，应为 pending", st.RollbackPhase())
+	}
+	if st.Pending == nil || st.Pending.TargetSlot != "slot-b" {
+		t.Fatalf("Reload 后登记 = %+v，应为 slot-b", st.Pending)
+	}
+	// 刷新绝不回写盘：回写就是亲手抹掉别人刚写下的登记。
+	if _, err := os.Stat(filepath.Join(dir, "pending.json")); err != nil {
+		t.Fatalf("Reload 之后 pending.json 必须还在盘上：%v", err)
+	}
+	if st.Reload() {
+		t.Fatal("同一个登记重复读一次不该再报变化")
+	}
+}
+
+// TestReloadKeepsTheLastGoodValueForABrokenFile: a corrupt file must not clear the
+// in-memory state - that would send the menu back to its default and hide a
+// registration that really is on disk - and it must not grow one warning per tick.
+// A missing pending.json is the other thing entirely: that is "nothing registered".
+func TestReloadKeepsTheLastGoodValueForABrokenFile(t *testing.T) {
+	st, dir := newTestState(t)
+	if err := st.Register("slot-b"); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dir, "pending.json"), "{ 这不是 JSON")
+
+	if st.Reload() {
+		t.Fatal("坏文件不该被算成一次状态变化")
+	}
+	if st.RollbackPhase() != phasePending {
+		t.Fatalf("坏文件把内存里的登记清掉了：phase = %q", st.RollbackPhase())
+	}
+	if len(st.Warnings) == 0 {
+		t.Fatal("坏文件必须留下一条警告")
+	}
+	before := len(st.Warnings)
+	st.Reload()
+	st.Reload()
+	if len(st.Warnings) != before {
+		t.Fatalf("同样的坏文件每 2 秒刷一次就多一条警告：%d -> %d", before, len(st.Warnings))
+	}
+
+	if err := os.Remove(filepath.Join(dir, "pending.json")); err != nil {
+		t.Fatal(err)
+	}
+	if !st.Reload() {
+		t.Fatal("pending.json 消失后必须回到默认态")
+	}
+	if st.RollbackPhase() != phaseNone {
+		t.Fatalf("登记文件消失后 phase = %q，应为 none", st.RollbackPhase())
+	}
+}
+
 // TestRollbackTwoStates: not registered -> pending -> not registered again, with
 // nothing archived in between (user 2026-09-19).
 func TestRollbackTwoStates(t *testing.T) {

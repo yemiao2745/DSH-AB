@@ -10,3 +10,4 @@
 | (example row, replace it with real content) <plugin> | <upstream link> | <version> (slot-a or slot-b) | <purpose> | <patch file path> | <what the patch does> | no / <date last checked> |
 
 Every change gets three more lines: **why it changed**, **which files and behaviour changed**, **how to verify it on upgrade**.
+> 「补丁」指的是 dsh 自身与其插件的补丁（本安装对它们做的修改），与 DSH-AB 无关：DSH-AB 不修改 dsh，也不出现在这份台账里。

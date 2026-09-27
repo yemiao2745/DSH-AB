@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -53,6 +54,13 @@ var (
 // as it did before the owner window existed.
 func popupOwner() uintptr {
 	popupOwnerOnce.Do(func() {
+		// 建窗口和给它设图标必须是同一条线程：CreateWindowExW 建的窗口属于调用它的线程，
+		// 而 SendMessageW 给一条没有在取消息的线程发的消息会一直等下去。goroutine 在两次调用
+		// 之间换线程（Go 随时可以这么做）时，setPopupOwnerIcon 就会永久卡住 —— 在 HEAD 上
+		// 直接复现过（同样的测试有时通过、有时一卡十分钟）。把本 goroutine 钉在这条线程上，
+		// 且不解除：它此后就是这条 goroutine（生产里是 main，也正是 systray 取消息的那条）的线程。
+		runtime.LockOSThread()
+
 		class, err := windows.UTF16PtrFromString("STATIC")
 		if err != nil {
 			return

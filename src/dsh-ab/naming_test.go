@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -420,8 +419,9 @@ func TestEntryVersionAndSizeAreOnlyWrittenWhenTheyDiffer(t *testing.T) {
 }
 
 // 顺着重解析点走会把同一批文件算两遍，还可能绕回上一层变成死循环——dsh 的模块回退就是用 junction
-// 搭出来的，所以安装根体积只在重解析点外面算。mklink /J 不需要管理员权限；建不出来就跳过，而不是
-// 假装通过。
+// 搭出来的，所以安装根体积只在重解析点外面算。junction 由测试自己用 Windows API 建（newJunction，
+// DeviceIoControl + FSCTL_SET_REPARSE_POINT，与 mklink /J 同一个调用），不需要管理员权限，也不经过
+// 任何 shell；建不出来就失败，而不是假装通过。
 func TestDirSizeDoesNotWalkThroughAReparsePoint(t *testing.T) {
 	root := t.TempDir()
 	inner := filepath.Join(root, "inner")
@@ -432,8 +432,9 @@ func TestDirSizeDoesNotWalkThroughAReparsePoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := filepath.Join(root, "link")
-	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, inner).CombinedOutput(); err != nil {
-		t.Skipf("建不出 junction，跳过：%v（%s）", err, strings.TrimSpace(string(out)))
+	newJunction(t, link, inner)
+	if !isReparsePoint(link) {
+		t.Fatalf("%s 不是重解析点：这条测试会变成对普通目录的空断言", link)
 	}
 	got, err := dirSizeBytes(root)
 	if err != nil {

@@ -3,7 +3,6 @@ package main
 import (
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -190,12 +189,9 @@ func TestStartupFailureTextSaysWhenThereWasNoOutput(t *testing.T) {
 // TestRunnerReportsWhyTheChildStopped keeps the exit reason available to the
 // failure popup: "the process is gone" alone used to be the whole story.
 func TestRunnerReportsWhyTheChildStopped(t *testing.T) {
-	var cmd *exec.Cmd
-	if _, err := exec.LookPath("cmd.exe"); err == nil {
-		cmd = exec.Command("cmd.exe", "/c", "exit 3")
-	} else {
-		cmd = exec.Command("does-not-exist.exe")
-	}
+	// The stand-in is this test binary re-executed as the exit-3 helper (testhelper_test.go):
+	// a real process that really ends with an error, and no shell is named anywhere.
+	cmd := helperCommand(t, helperExit3)
 	r := &Runner{tail: newLineTail(childTailLines)}
 	exited := make(chan struct{})
 	r.cmd, r.exited = cmd, exited
@@ -477,11 +473,6 @@ func TestStartReturnsAndKeepsTheChild(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-only entry point")
 	}
-	comspec := os.Getenv("COMSPEC")
-	if comspec == "" {
-		t.Skip("no COMSPEC to stand in for the node executable")
-	}
-
 	root := t.TempDir()
 	slotRoot := filepath.Join(root, "slot-a")
 	if err := os.MkdirAll(filepath.Join(slotRoot, "node"), 0o755); err != nil {
@@ -490,12 +481,18 @@ func TestStartReturnsAndKeepsTheChild(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(slotRoot, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
-	// A real, harmless child that starts, writes to both streams and exits. The
-	// command line Start builds is "<exe> <entry> web --port N --no-open"; cmd
-	// simply fails to run the entry, which is all this test needs.
-	binary, err := os.ReadFile(comspec)
+	// A real, harmless child that starts and exits at once. The command line Start builds is
+	// "<exe> <entry> web --port N --no-open", and the stand-in is this test binary re-executed
+	// as the exit-0 helper: it ignores that command line instead of handing it to a shell
+	// (testhelper_test.go). The helper mode travels in launch.env, which is exactly the
+	// mechanism a config file uses to give the child its environment.
+	exe, err := helperBinary()
 	if err != nil {
-		t.Skipf("cannot read COMSPEC: %v", err)
+		t.Skipf("cannot find the test binary: %v", err)
+	}
+	binary, err := os.ReadFile(exe)
+	if err != nil {
+		t.Skipf("cannot read the test binary: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(slotRoot, "node", "node.exe"), binary, 0o755); err != nil {
 		t.Fatalf("write stand-in node: %v", err)
@@ -508,6 +505,7 @@ func TestStartReturnsAndKeepsTheChild(t *testing.T) {
 	defer lg.Close()
 	cfg := DefaultConfig()
 	cfg.Launch.DshEntry = "app/dsh.js"
+	cfg.Launch.Env = map[string]string{testHelperEnv: helperExit0}
 	r := NewRunner(root, cfg, lg)
 
 	done := make(chan error, 1)

@@ -382,7 +382,7 @@ func TestLogNoteTellsTheTruthAboutAnUnwritableLogDirectory(t *testing.T) {
 
 	a, _ := newTestApp(t, DefaultConfig(), nil)
 	a.lg = lg
-	// auto 档的写入门槛是 warn/debug（Info 已归 full 档），用一条 auto 真会写的行。
+	// auto 档的写入门槛是 warn/info（debug 只在 full 档），用一条 auto 真会写的行。
 	lg.Warnf("这一行写不进去")
 
 	if lg.WriteError() == nil {
@@ -414,8 +414,8 @@ func TestLogNoteTellsTheTruthAboutAnUnwritableLogDirectory(t *testing.T) {
 }
 
 // TestLogLevelThresholds pins the three level gates with one
-// batch of lines: off keeps errors only, auto adds warnings and debug, full keeps
-// everything - info included, and the child's output, which is tagged with the
+// batch of lines: off keeps errors only, auto adds info and warns, full keeps
+// everything - debug lines and the child's output included, which is tagged with the
 // slot it came from because one log file accumulates both slots across restarts.
 func TestLogLevelThresholds(t *testing.T) {
 	cases := []struct {
@@ -423,9 +423,9 @@ func TestLogLevelThresholds(t *testing.T) {
 		want  []string
 		deny  []string
 	}{
-		{LevelOff, []string{"markErr"}, []string{"markWarn", "markDebug", "markInfo", "markChild"}},
-		{LevelAuto, []string{"markErr", "markWarn", "markDebug"}, []string{"markInfo", "markChild"}},
-		{LevelFull, []string{"markErr", "markWarn", "markDebug", "markInfo", "child-slot-a markChildA", "child-slot-b markChildB"}, nil},
+		{LevelOff, []string{"markErr"}, []string{"markWarn", "markInfo", "markDebug", "markChild"}},
+		{LevelAuto, []string{"markErr", "markWarn", "markInfo"}, []string{"markDebug", "markChild"}},
+		{LevelFull, []string{"markErr", "markWarn", "markInfo", "markDebug", "child-slot-a markChildA", "child-slot-b markChildB"}, nil},
 	}
 	for _, c := range cases {
 		lg := NewLogger(t.TempDir(), c.level, 20, 5)
